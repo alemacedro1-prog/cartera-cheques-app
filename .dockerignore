@@ -1,0 +1,11 @@
+.git
+.venv
+__pycache__
+.pytest_cache
+.streamlit/secrets.toml
+tests
+*.xlsx
+*.xlsm
+*.xls
+data/report_history/*.pdf
+data/report_history/*.json
