@@ -10,6 +10,7 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
+from utils.analytics import apply_operational_scope, receipt_summary, rejected_bank_summary
 from utils.portfolio import (
     ALLOWED_TYPES,
     ConcentradorError,
@@ -30,7 +31,7 @@ from utils.security import (
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 LOGGER = logging.getLogger("cartera")
-PROCESSING_RULE_VERSION = "2026-08-18-any-internal-receipt-75-session-v5"
+PROCESSING_RULE_VERSION = "2026-08-19-receipts-cutoff-bank-stats-v6"
 BANK_FILTER_OPTIONS = ("Macro", "Galicia", "Nación")
 
 
@@ -341,6 +342,180 @@ def client_exposure_chart(data: pd.DataFrame) -> None:
         st.caption("Se muestran los 10 clientes con mayor exposición.")
 
 
+def receipt_coverage_chart(data: pd.DataFrame) -> None:
+    summary = receipt_summary(data)
+    st.subheader("Movimientos con y sin recibo")
+    st.caption("Compara cantidad e importe de los movimientos incluidos en la vista actual.")
+    if summary.empty or int(summary["Cantidad"].sum()) == 0:
+        st.info("No hay movimientos para analizar en la vista actual.", icon=":material/receipt_long:")
+        return
+
+    dark_theme = st.context.theme.type == "dark"
+    foreground = "#E7EEF8" if dark_theme else "#23364A"
+    grid = "#2A3B53" if dark_theme else "#DCE5EE"
+    colors = ["#5DD39E", "#FF8B86"] if dark_theme else ["#2E8B70", "#C95651"]
+    color = alt.Color(
+        "Vínculo:N",
+        title=None,
+        scale=alt.Scale(domain=["Con recibo", "Sin recibo"], range=colors),
+        legend=alt.Legend(orient="bottom", direction="horizontal", symbolType="circle"),
+    )
+
+    count_base = alt.Chart(summary)
+    count_arcs = count_base.mark_arc(innerRadius=64, outerRadius=112, padAngle=0.025, cornerRadius=5).encode(
+        theta=alt.Theta("Cantidad:Q", stack=True),
+        color=color,
+        tooltip=[
+            alt.Tooltip("Vínculo:N", title="Estado"),
+            alt.Tooltip("Cantidad:Q", title="Cheques", format=",.0f"),
+            alt.Tooltip("Participación cantidad:Q", title="Participación", format=".1%"),
+            alt.Tooltip("Importe:Q", title="Importe", format="$,.2f"),
+        ],
+    )
+    count_labels = count_base.mark_text(radius=88, color="#FFFFFF", fontSize=12, fontWeight=700).encode(
+        theta=alt.Theta("Cantidad:Q", stack=True),
+        text=alt.condition(
+            alt.datum["Participación cantidad"] >= 0.08,
+            alt.Text("Participación cantidad:Q", format=".0%"),
+            alt.value(""),
+        ),
+    )
+    total_count = f"{int(summary['Cantidad'].sum()):,}".replace(",", ".")
+    count_center = alt.Chart(pd.DataFrame({"Total": [total_count]})).mark_text(
+        color=foreground, fontSize=18, fontWeight=700
+    ).encode(text="Total:N")
+    count_chart = (count_arcs + count_labels + count_center).properties(height=300)
+
+    amount_max = max(float(summary["Importe"].max()), 1.0)
+    amount_base = alt.Chart(summary).encode(
+        y=alt.Y("Vínculo:N", title=None, sort=["Con recibo", "Sin recibo"]),
+        x=alt.X(
+            "Importe:Q",
+            title="Importe",
+            axis=alt.Axis(format="$,.0s"),
+            scale=alt.Scale(domain=[0, amount_max * 1.28]),
+        ),
+        color=color,
+    )
+    amount_bars = amount_base.mark_bar(cornerRadiusEnd=8, size=34).encode(
+        tooltip=[
+            alt.Tooltip("Vínculo:N", title="Estado"),
+            alt.Tooltip("Cantidad:Q", title="Cheques", format=",.0f"),
+            alt.Tooltip("Importe:Q", title="Importe", format="$,.2f"),
+            alt.Tooltip("Importe promedio:Q", title="Promedio", format="$,.2f"),
+            alt.Tooltip("Participación importe:Q", title="Participación", format=".1%"),
+        ]
+    )
+    amount_labels = amount_base.mark_text(
+        align="left", baseline="middle", dx=8, color=foreground, fontSize=12, fontWeight=700
+    ).encode(text=alt.Text("Importe:Q", format="$,.0s"))
+    amount_chart = (amount_bars + amount_labels).properties(height=300)
+
+    count_column, amount_column = st.columns([0.9, 1.25])
+    with count_column:
+        st.markdown("**Cantidad de cheques**")
+        st.altair_chart(
+            count_chart.configure_view(stroke=None).configure_legend(labelColor=foreground, titleColor=foreground),
+            key="chart_receipt_count",
+        )
+    with amount_column:
+        st.markdown("**Importe asociado**")
+        st.altair_chart(
+            amount_chart.configure_view(stroke=None).configure_axis(
+                labelColor=foreground, titleColor=foreground, gridColor=grid, domainColor=grid, tickColor=grid
+            ).configure_legend(labelColor=foreground, titleColor=foreground),
+            key="chart_receipt_amount",
+        )
+    with st.expander("Ver estadísticas de recibos", icon=":material/table_view:"):
+        st.dataframe(
+            summary,
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "Cantidad": st.column_config.NumberColumn("Cheques", format="%d"),
+                "Importe": st.column_config.NumberColumn(format="$ %.2f"),
+                "Importe promedio": st.column_config.NumberColumn(format="$ %.2f"),
+                "Participación cantidad": st.column_config.ProgressColumn("% cheques", format="percent"),
+                "Participación importe": st.column_config.ProgressColumn("% importe", format="percent"),
+            },
+        )
+
+
+def rejected_bank_chart(data: pd.DataFrame) -> None:
+    summary = rejected_bank_summary(data)
+    st.subheader("Rechazados por banco")
+    st.caption("Estadísticas exclusivas de Banco Macro, Galicia y Nación.")
+    if summary.empty:
+        st.info("No hay cheques rechazados de estos tres bancos en la vista actual.", icon=":material/account_balance:")
+        return
+
+    indexed = summary.set_index("Banco")
+    with st.container(horizontal=True):
+        for bank in BANK_FILTER_OPTIONS:
+            amount = float(indexed.at[bank, "Importe rechazado"]) if bank in indexed.index else 0.0
+            count = int(indexed.at[bank, "Cantidad de rechazados"]) if bank in indexed.index else 0
+            st.metric(f"{bank} · {count} rechazados", format_currency(amount), border=True)
+
+    dark_theme = st.context.theme.type == "dark"
+    foreground = "#E7EEF8" if dark_theme else "#23364A"
+    grid = "#2A3B53" if dark_theme else "#DCE5EE"
+    palette = ["#67B7F7", "#B99AF5", "#F8C65A"] if dark_theme else ["#245A8D", "#7957B8", "#C48717"]
+    chart_data = summary.copy()
+    chart_data["Etiqueta"] = chart_data.apply(
+        lambda row: f"{format_currency(row['Importe rechazado'])} · {int(row['Cantidad de rechazados'])} chq.", axis=1
+    )
+    amount_max = max(float(chart_data["Importe rechazado"].max()), 1.0)
+    base = alt.Chart(chart_data).encode(
+        y=alt.Y("Banco:N", title=None, sort=list(BANK_FILTER_OPTIONS)),
+        x=alt.X(
+            "Importe rechazado:Q",
+            title="Importe rechazado",
+            axis=alt.Axis(format="$,.0s"),
+            scale=alt.Scale(domain=[0, amount_max * 1.42]),
+        ),
+        color=alt.Color(
+            "Banco:N",
+            title=None,
+            scale=alt.Scale(domain=list(BANK_FILTER_OPTIONS), range=palette),
+            legend=None,
+        ),
+    )
+    bars = base.mark_bar(cornerRadiusEnd=8, size=36).encode(
+        tooltip=[
+            alt.Tooltip("Banco:N", title="Banco"),
+            alt.Tooltip("Cantidad de rechazados:Q", title="Rechazados", format=",.0f"),
+            alt.Tooltip("Importe rechazado:Q", title="Importe", format="$,.2f"),
+            alt.Tooltip("Importe promedio:Q", title="Promedio", format="$,.2f"),
+            alt.Tooltip("Clientes afectados:Q", title="Clientes", format=",.0f"),
+        ]
+    )
+    labels = base.mark_text(
+        align="left", baseline="middle", dx=9, color=foreground, fontSize=12, fontWeight=700
+    ).encode(text="Etiqueta:N")
+    chart = (bars + labels).properties(height=260).configure_view(stroke=None).configure_axis(
+        labelColor=foreground,
+        titleColor=foreground,
+        gridColor=grid,
+        domainColor=grid,
+        tickColor=grid,
+        labelFontSize=12,
+        titleFontSize=12,
+    )
+    st.altair_chart(chart, key="chart_rejected_banks")
+    with st.expander("Ver estadísticas por banco", icon=":material/table_view:"):
+        st.dataframe(
+            summary,
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "Cantidad de rechazados": st.column_config.NumberColumn(format="%d"),
+                "Importe rechazado": st.column_config.NumberColumn(format="$ %.2f"),
+                "Importe promedio": st.column_config.NumberColumn(format="$ %.2f"),
+                "Clientes afectados": st.column_config.NumberColumn(format="%d"),
+            },
+        )
+
+
 def rejected_trend_chart(data: pd.DataFrame) -> None:
     monthly = rejected_monthly_summary(data)
     st.subheader("Rechazados: cuándo y quiénes")
@@ -506,7 +681,13 @@ with st.sidebar:
             help="Excel original del CONRENPF. Máximo 15 MB.",
             key="source_file",
         )
-        cutoff = st.date_input("Fecha de corte", value=date.today(), format="DD/MM/YYYY")
+        cutoff = st.date_input(
+            "Fecha de corte / acreditación",
+            value=date.today(),
+            format="DD/MM/YYYY",
+            help="Se considera acreditado todo cheque cuya fecha de acreditación sea igual o anterior a este corte.",
+        )
+        st.caption("La cartera se recalcula completa al mover esta fecha.")
         if uploaded is not None and st.button("Descartar archivo", icon=":material/delete:", width="stretch"):
             st.cache_data.clear(); st.session_state.pop("source_file", None); st.rerun()
 
@@ -545,11 +726,15 @@ with st.sidebar:
             key="portfolio_scope",
         )
     with st.expander("Comprobantes", icon=":material/receipt_long:", expanded=False):
-        receipt_scope = st.selectbox(
-            "Comprobante asociado",
-            ["Todos", "Con comprobante asociado", "Sin comprobante asociado"],
-            key="receipt_filter",
-        )
+        if scope == "En cartera":
+            receipt_scope = "Con comprobante asociado"
+            st.info("En cartera muestra todos los cheques con recibo, estén acreditados o no.", icon=":material/receipt_long:")
+        else:
+            receipt_scope = st.selectbox(
+                "Comprobante asociado",
+                ["Todos", "Con comprobante asociado", "Sin comprobante asociado"],
+                key="receipt_filter",
+            )
     with st.expander("Filtros operativos", icon=":material/filter_alt:", expanded=False):
         selected_types = st.pills("Tipos", list(ALLOWED_TYPES), default=list(ALLOWED_TYPES), selection_mode="multi")
         selected_clients = st.multiselect("Clientes", sorted(x for x in portfolio["Cliente"].dropna().unique() if x), placeholder="Todos")
@@ -561,14 +746,7 @@ with st.sidebar:
         )
         search = st.text_input("Buscar cheque, CUIT o recibo", placeholder="Número o texto")
 
-filtered = portfolio.copy()
-scopes = {
-    "En cartera": ["Pendiente", "Pendiente de acreditación", "Vencido", "Vence hoy"],
-    "Rechazados": ["Rechazado"],
-    "Acreditados": ["Acreditado"],
-}
-if scope == "Pend. acreditación": filtered = filtered[filtered["Código estado"].eq("PS")]
-elif scope in scopes: filtered = filtered[filtered["Estado calculado"].isin(scopes[scope])]
+filtered = apply_operational_scope(portfolio, scope)
 if receipt_scope == "Con comprobante asociado": filtered = filtered[filtered["Estado recibo"].eq("Tomado")]
 elif receipt_scope == "Sin comprobante asociado": filtered = filtered[filtered["Estado recibo"].eq("Sin recibo asociado")]
 filtered = filtered[filtered["Tipo"].isin(selected_types)] if selected_types else filtered.iloc[0:0]
@@ -580,7 +758,7 @@ if search.strip():
     searchable = filtered[["Cliente", "CUIT cliente", "N° cheque / eCheq", "Recibo relacionado"]].fillna("").astype(str).agg(" ".join, axis=1).str.casefold()
     filtered = filtered[searchable.str.contains(needle, regex=False)]
 
-in_portfolio = filtered[filtered["Estado calculado"].isin(["Pendiente", "Pendiente de acreditación", "Vencido", "Vence hoy"])]
+in_portfolio = filtered[filtered["Estado recibo"].eq("Tomado")]
 rejected = filtered[filtered["Estado calculado"].eq("Rechazado")]
 next_7 = filtered[filtered["Estado calculado"].isin(["Pendiente", "Vence hoy"]) & filtered["Días al vencimiento"].between(0, 7, inclusive="both")]
 with st.container(horizontal=True):
@@ -588,10 +766,26 @@ with st.container(horizontal=True):
     st.metric("En cartera", format_currency(in_portfolio["Importe"].sum()), border=True)
     st.metric("Próximos 7 días", format_currency(next_7["Importe"].sum()), border=True)
     st.metric("Rechazados", format_currency(rejected["Importe"].sum()), border=True)
+with_receipt = filtered[filtered["Estado recibo"].eq("Tomado")]
+without_receipt = filtered[filtered["Estado recibo"].ne("Tomado")]
+total_count = len(filtered)
+receipt_coverage = len(with_receipt) / total_count if total_count else 0.0
+amount_total = float(filtered["Importe"].sum())
+receipt_amount_share = float(with_receipt["Importe"].sum()) / amount_total if amount_total else 0.0
+with st.container(horizontal=True):
+    st.metric(f"Total · {total_count:,} cheques".replace(",", "."), format_currency(amount_total), border=True)
+    st.metric(f"Con recibo · {len(with_receipt):,} cheques".replace(",", "."), format_currency(with_receipt["Importe"].sum()), border=True)
+    st.metric(f"Sin recibo · {len(without_receipt):,} cheques".replace(",", "."), format_currency(without_receipt["Importe"].sum()), border=True)
+    st.metric(f"Cobertura · {receipt_amount_share:.1%} del importe", f"{receipt_coverage:.1%}", border=True)
 st.caption(f":material/data_check: {len(filtered):,} instrumentos incluidos en la vista actual.".replace(",", "."))
+st.caption(f":material/event_available: Acreditación calculada al **{cutoff:%d/%m/%Y}**.")
 if scope == "Pend. acreditación":
     ps_in_file = int(portfolio["Código estado"].eq("PS").sum())
-    st.caption(f":material/pending_actions: PS detectados en el archivo: **{ps_in_file:,}** · visibles con los demás filtros: **{len(filtered):,}**".replace(",", "."))
+    pending_at_cutoff = int(portfolio["Estado calculado"].eq("Pendiente de acreditación").sum())
+    st.caption(
+        f":material/pending_actions: Pendientes según el corte: **{pending_at_cutoff:,}** · "
+        f"código PS en el archivo: **{ps_in_file:,}** · visibles con los demás filtros: **{len(filtered):,}**".replace(",", ".")
+    )
 
 view = st.segmented_control(
     "Planilla",
@@ -604,6 +798,8 @@ if view == "Resumen ejecutivo":
         donut_chart(filtered, "Tipo", "Importe por tipo", "chart_type")
     with right, st.container(border=True, height="stretch"):
         donut_chart(filtered, "Estado calculado", "Importe por estado", "chart_state")
+    with st.container(border=True):
+        receipt_coverage_chart(filtered)
     left, right = st.columns(2)
     with left, st.container(border=True, height="stretch"):
         due_flow_chart(filtered, cutoff)
@@ -611,6 +807,8 @@ if view == "Resumen ejecutivo":
         client_exposure_chart(filtered)
     with st.container(border=True):
         rejected_trend_chart(filtered)
+    with st.container(border=True):
+        rejected_bank_chart(filtered)
     st.subheader("Próximos vencimientos")
     next_due = filtered[filtered["Estado calculado"].isin(["Pendiente", "Vence hoy"]) & filtered["Fecha vencimiento"].between(pd.Timestamp(cutoff), pd.Timestamp(cutoff + timedelta(days=30)), inclusive="both")]
     st.dataframe(next_due.sort_values(["Fecha vencimiento", "Importe"], ascending=[True, False])[["Fecha vencimiento", "Cliente", "Tipo", "N° cheque / eCheq", "Importe", "Estado calculado"]].head(25), hide_index=True,

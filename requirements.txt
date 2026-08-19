@@ -3,3 +3,4 @@ pandas==3.0.0
 openpyxl==3.1.5
 altair==6.0.0
 reportlab==4.4.9
+# Fuerza un despliegue limpio al actualizar las reglas de cartera y acreditación.

@@ -201,7 +201,9 @@ def build_portfolio(raw: pd.DataFrame, cutoff: date | pd.Timestamp | None = None
             state = "Rechazado"
         elif original_state in PENDING_ACCREDITATION_STATES:
             state = "Pendiente de acreditación"
-        elif original_state == "AC" or (not pd.isna(accreditation_date) and accreditation_date <= cutoff_ts):
+        elif not pd.isna(accreditation_date):
+            state = "Acreditado" if accreditation_date <= cutoff_ts else "Pendiente de acreditación"
+        elif original_state == "AC":
             state = "Acreditado"
         elif pd.isna(due_date):
             state = "Sin vencimiento"
@@ -308,11 +310,20 @@ def export_excel(portfolio: pd.DataFrame, raw: pd.DataFrame, cutoff: date) -> by
     scoped_raw = scoped_raw.drop(columns=["MCR-Número de recibo", "Nro Cpb Relacionado"], errors="ignore")
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        in_states = ["Pendiente", "Pendiente de acreditación", "Vencido", "Vence hoy"]
-        summary = pd.DataFrame({"Indicador": ["Fecha de corte", "Instrumentos", "Importe total", "En cartera", "Rechazados"],
-            "Valor": [pd.Timestamp(cutoff), len(portfolio), portfolio["Importe"].sum(),
-                      portfolio.loc[portfolio["Estado calculado"].isin(in_states), "Importe"].sum(),
-                      portfolio.loc[portfolio["Estado calculado"].eq("Rechazado"), "Importe"].sum()]})
+        with_receipt = portfolio["Estado recibo"].eq("Tomado")
+        summary = pd.DataFrame({
+            "Indicador": [
+                "Fecha de corte", "Instrumentos", "Importe total", "En cartera (con recibo)",
+                "Cheques con recibo", "Importe con recibo", "Cheques sin recibo", "Importe sin recibo", "Rechazados",
+            ],
+            "Valor": [
+                pd.Timestamp(cutoff), len(portfolio), portfolio["Importe"].sum(),
+                portfolio.loc[with_receipt, "Importe"].sum(), int(with_receipt.sum()),
+                portfolio.loc[with_receipt, "Importe"].sum(), int((~with_receipt).sum()),
+                portfolio.loc[~with_receipt, "Importe"].sum(),
+                portfolio.loc[portfolio["Estado calculado"].eq("Rechazado"), "Importe"].sum(),
+            ],
+        })
         summary.to_excel(writer, sheet_name="Resumen", index=False)
         _excel_safe(portfolio).to_excel(writer, sheet_name="Cartera", index=False)
         _excel_safe(scoped_raw).to_excel(writer, sheet_name="Datos fuente filtrados", index=False)

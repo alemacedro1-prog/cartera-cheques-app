@@ -148,6 +148,33 @@ def test_rejection_metadata_does_not_override_accredited_state():
     assert build_portfolio(frame, date(2026, 8, 18)).iloc[0]["Estado calculado"] == "Acreditado"
 
 
+def test_accreditation_date_after_cutoff_is_still_pending():
+    frame = pd.DataFrame([row(**{"MCR-Estado instr.": "AC", "MCR-Fecha acredit.": "21/08/2026"})])
+
+    result = build_portfolio(frame, date(2026, 8, 18)).iloc[0]
+
+    assert result["Estado calculado"] == "Pendiente de acreditación"
+    assert "PENDIENTE DE ACREDITACIÓN" in result["Alertas"]
+
+
+def test_moving_cutoff_to_accreditation_date_marks_cheque_accredited():
+    frame = pd.DataFrame([row(**{"MCR-Estado instr.": "PE", "MCR-Fecha acredit.": "21/08/2026"})])
+
+    before = build_portfolio(frame, date(2026, 8, 20)).iloc[0]
+    at_date = build_portfolio(frame, date(2026, 8, 21)).iloc[0]
+
+    assert before["Estado calculado"] == "Pendiente de acreditación"
+    assert at_date["Estado calculado"] == "Acreditado"
+
+
+def test_accredited_state_without_accreditation_date_remains_accredited():
+    frame = pd.DataFrame([row(**{"MCR-Estado instr.": "AC", "MCR-Fecha acredit.": None})])
+
+    result = build_portfolio(frame, date(2026, 8, 18)).iloc[0]
+
+    assert result["Estado calculado"] == "Acreditado"
+
+
 def test_ps_is_pending_accreditation_even_with_rejection_metadata():
     frame = pd.DataFrame([row(**{
         "MCR-Estado instr.": "PS",
@@ -244,8 +271,13 @@ def test_export_is_filtered_and_neutralizes_formulas():
     ])
     portfolio = build_portfolio(raw, date(2026, 8, 18)).iloc[[0]]
     exported = export_excel(portfolio, raw, date(2026, 8, 18))
+    summary = pd.read_excel(BytesIO(exported), sheet_name="Resumen")
     cartera = pd.read_excel(BytesIO(exported), sheet_name="Cartera")
     source = pd.read_excel(BytesIO(exported), sheet_name="Datos fuente filtrados")
+    indicators = summary.set_index("Indicador")["Valor"]
+    assert indicators["Cheques con recibo"] == 1
+    assert indicators["Cheques sin recibo"] == 0
+    assert indicators["Importe con recibo"] == 1000
     assert "MCR-Número de recibo" not in cartera.columns
     assert "MCR-Número de recibo" not in source.columns
     assert "Nro Cpb Relacionado" not in source.columns
