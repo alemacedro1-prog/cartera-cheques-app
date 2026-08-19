@@ -10,7 +10,9 @@ import streamlit as st
 
 from utils.portfolio import (
     ALLOWED_TYPES,
+    BANK_FILTER_OPTIONS,
     ConcentradorError,
+    bank_filter_group,
     export_excel,
     format_currency,
     portfolio_from_bytes,
@@ -525,7 +527,12 @@ with st.sidebar:
     with st.expander("Filtros operativos", icon=":material/filter_alt:", expanded=False):
         selected_types = st.pills("Tipos", list(ALLOWED_TYPES), default=list(ALLOWED_TYPES), selection_mode="multi")
         selected_clients = st.multiselect("Clientes", sorted(x for x in portfolio["Cliente"].dropna().unique() if x), placeholder="Todos")
-        selected_banks = st.multiselect("Bancos", sorted(x for x in portfolio["Banco cheque"].dropna().unique() if x), placeholder="Todos")
+        selected_banks = st.pills(
+            "Bancos",
+            list(BANK_FILTER_OPTIONS),
+            selection_mode="multi",
+            help="Filtro operativo limitado a Banco Macro, Galicia y Nación.",
+        )
         search = st.text_input("Buscar cheque, CUIT o recibo", placeholder="Número o texto")
 
 filtered = portfolio.copy()
@@ -540,7 +547,8 @@ if receipt_scope == "Con comprobante asociado": filtered = filtered[filtered["Es
 elif receipt_scope == "Sin comprobante asociado": filtered = filtered[filtered["Estado recibo"].eq("Sin recibo asociado")]
 filtered = filtered[filtered["Tipo"].isin(selected_types)] if selected_types else filtered.iloc[0:0]
 if selected_clients: filtered = filtered[filtered["Cliente"].isin(selected_clients)]
-if selected_banks: filtered = filtered[filtered["Banco cheque"].isin(selected_banks)]
+if selected_banks:
+    filtered = filtered[filtered["Banco cheque"].map(bank_filter_group).isin(selected_banks)]
 if search.strip():
     needle = search.strip().casefold()
     searchable = filtered[["Cliente", "CUIT cliente", "N° cheque / eCheq", "Recibo relacionado"]].fillna("").astype(str).agg(" ".join, axis=1).str.casefold()

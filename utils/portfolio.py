@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import re
+import unicodedata
 import zipfile
 from datetime import date, datetime
 from typing import BinaryIO
@@ -11,6 +12,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 ALLOWED_TYPES = ("CH24", "CH48", "CPD", "ECHEQ", "ECHEQDIF")
+BANK_FILTER_OPTIONS = ("Macro", "Galicia", "Nación")
 REJECTED_STATES = {"RE", "RC"}
 PENDING_ACCREDITATION_STATES = {"PS"}
 MAX_FILE_BYTES = 15 * 1024 * 1024
@@ -34,6 +36,29 @@ def _identifier(value) -> str:
     if not text or text == "0":
         return ""
     return text[:-2] if re.fullmatch(r"-?\d+\.0", text) else text
+
+
+def bank_filter_group(value) -> str:
+    """Agrupa los bancos operativos admitiendo código BCRA o denominación."""
+    text = _identifier(value)
+    if not text:
+        return ""
+
+    numeric = re.fullmatch(r"0*(\d+)", text)
+    if numeric:
+        by_code = {"7": "Galicia", "11": "Nación", "285": "Macro"}
+        if numeric.group(1) in by_code:
+            return by_code[numeric.group(1)]
+
+    normalized = unicodedata.normalize("NFKD", text)
+    normalized = "".join(character for character in normalized if not unicodedata.combining(character)).upper()
+    if "MACRO" in normalized:
+        return "Macro"
+    if "GALICIA" in normalized:
+        return "Galicia"
+    if "NACION" in normalized:
+        return "Nación"
+    return ""
 
 
 def _system_state(value) -> tuple[str, str]:

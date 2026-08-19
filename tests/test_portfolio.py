@@ -6,7 +6,9 @@ import pytest
 
 from utils.portfolio import (
     ALLOWED_TYPES,
+    BANK_FILTER_OPTIONS,
     ConcentradorError,
+    bank_filter_group,
     build_portfolio,
     export_excel,
     read_concentrador,
@@ -21,6 +23,27 @@ def row(**changes):
             "MCR-Fecha vencim.": "20/08/2026", "MCR-Número de recibo": "900", "Nro Cpb Relación": "900"}
     base.update(changes)
     return base
+
+
+def test_bank_filter_exposes_only_the_three_operational_banks():
+    assert BANK_FILTER_OPTIONS == ("Macro", "Galicia", "Nación")
+
+
+@pytest.mark.parametrize(("raw_bank", "expected"), [
+    ("285", "Macro"),
+    ("0285", "Macro"),
+    ("Banco Macro S.A.", "Macro"),
+    ("7", "Galicia"),
+    ("007", "Galicia"),
+    ("Banco de Galicia y Buenos Aires", "Galicia"),
+    ("11", "Nación"),
+    ("011", "Nación"),
+    ("Banco de la Nación Argentina", "Nación"),
+    ("NACIÓN", "Nación"),
+    ("72", ""),
+])
+def test_bank_filter_groups_codes_and_names(raw_bank, expected):
+    assert bank_filter_group(raw_bank) == expected
 
 
 def make_xlsx(rows, preamble=2):
