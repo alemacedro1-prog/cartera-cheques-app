@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
+import unicodedata
 from datetime import date, timedelta
 
 import altair as alt
@@ -10,9 +12,7 @@ import streamlit as st
 
 from utils.portfolio import (
     ALLOWED_TYPES,
-    BANK_FILTER_OPTIONS,
     ConcentradorError,
-    bank_filter_group,
     export_excel,
     format_currency,
     portfolio_from_bytes,
@@ -31,6 +31,32 @@ from utils.security import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 LOGGER = logging.getLogger("cartera")
 PROCESSING_RULE_VERSION = "2026-08-18-any-internal-receipt-75-session-v5"
+BANK_FILTER_OPTIONS = ("Macro", "Galicia", "Nación")
+
+
+def bank_filter_group(value) -> str:
+    """Normaliza los tres bancos del filtro sin depender de un módulo en caché."""
+    text = "" if value is None or pd.isna(value) else str(value).strip()
+    if not text:
+        return ""
+    if text.endswith(".0") and re.fullmatch(r"\d+\.0", text):
+        text = text[:-2]
+
+    numeric = re.fullmatch(r"0*(\d+)", text)
+    if numeric:
+        by_code = {"7": "Galicia", "11": "Nación", "285": "Macro"}
+        if numeric.group(1) in by_code:
+            return by_code[numeric.group(1)]
+
+    normalized = unicodedata.normalize("NFKD", text)
+    normalized = "".join(character for character in normalized if not unicodedata.combining(character)).upper()
+    if "MACRO" in normalized:
+        return "Macro"
+    if "GALICIA" in normalized:
+        return "Galicia"
+    if "NACION" in normalized:
+        return "Nación"
+    return ""
 
 st.set_page_config(page_title="Cartera de cheques", page_icon=":material/account_balance_wallet:", layout="wide")
 
