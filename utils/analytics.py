@@ -1,23 +1,78 @@
 from __future__ import annotations
 
+from datetime import date
+
 import pandas as pd
 
-from utils.portfolio import BANK_FILTER_OPTIONS, bank_filter_group
+from utils.portfolio import BANK_FILTER_OPTIONS, PENDING_COLLECTION_STATES, bank_filter_group
 
 
-def apply_operational_scope(portfolio: pd.DataFrame, scope: str) -> pd.DataFrame:
-    """Aplica las vistas operativas con una única definición de "En cartera"."""
+def pending_collection(portfolio: pd.DataFrame) -> pd.DataFrame:
+    """Devuelve los cheques que todavía representan un cobro pendiente."""
     if portfolio.empty:
         return portfolio.copy()
+    return portfolio[portfolio["Estado calculado"].isin(PENDING_COLLECTION_STATES)].copy()
+
+
+def pending_for_month(portfolio: pd.DataFrame, cutoff: date | pd.Timestamp) -> pd.DataFrame:
+    """Devuelve cobros pendientes cuya fecha prevista pertenece al mes analizado."""
+    pending = pending_collection(portfolio)
+    if pending.empty:
+        return pending
+    expected = pd.to_datetime(
+        pending.get("Fecha prevista de cobro", pd.Series(pd.NaT, index=pending.index)), dayfirst=True, errors="coerce"
+    )
+    month_start = pd.Timestamp(cutoff).to_period("M").to_timestamp()
+    month_end = month_start + pd.offsets.MonthEnd(0)
+    return pending[expected.between(month_start, month_end, inclusive="both")].copy()
+
+
+def apply_operational_scope(
+    portfolio: pd.DataFrame,
+    scope: str,
+    cutoff: date | pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    """Aplica vistas operativas con nombres pensados para usuarios no técnicos."""
+    if portfolio.empty:
+        return portfolio.copy()
+    if scope == "Pendientes del mes":
+        return pending_for_month(portfolio, cutoff or pd.Timestamp.today())
+    if scope == "Todos los pendientes":
+        return pending_collection(portfolio)
     if scope == "En cartera":
         return portfolio[portfolio["Estado recibo"].eq("Tomado")].copy()
-    if scope == "Pend. acreditación":
+    if scope in {"Pend. acreditación", "Pendientes de acreditación"}:
         return portfolio[portfolio["Estado calculado"].eq("Pendiente de acreditación")].copy()
-    if scope == "Rechazados":
+    if scope in {"Rechazados", "Rechazados (RC)"}:
         return portfolio[portfolio["Estado calculado"].eq("Rechazado")].copy()
-    if scope == "Acreditados":
+    if scope in {"Rescatados", "Rescatados (RE)"}:
+        return portfolio[portfolio["Estado calculado"].eq("Rescatado")].copy()
+    if scope in {"Acreditados", "Acreditados (AC)"}:
         return portfolio[portfolio["Estado calculado"].eq("Acreditado")].copy()
     return portfolio.copy()
+
+
+def collection_calendar_summary(portfolio: pd.DataFrame, cutoff: date | pd.Timestamp) -> pd.DataFrame:
+    """Agrupa por día los cobros pendientes del mes seleccionado."""
+    columns = ["Fecha prevista de cobro", "Situación", "Cantidad", "Importe", "Clientes"]
+    monthly = pending_for_month(portfolio, cutoff)
+    if monthly.empty:
+        return pd.DataFrame(columns=columns)
+    monthly["Fecha prevista de cobro"] = pd.to_datetime(
+        monthly["Fecha prevista de cobro"], dayfirst=True, errors="coerce"
+    )
+    cutoff_ts = pd.Timestamp(cutoff).normalize()
+    monthly["Situación"] = monthly["Fecha prevista de cobro"].map(
+        lambda value: "Fecha ya cumplida" if value < cutoff_ts else "Próximo cobro"
+    )
+    monthly["Importe"] = pd.to_numeric(monthly["Importe"], errors="coerce").fillna(0)
+    monthly["Cliente"] = monthly.get("Cliente", pd.Series(index=monthly.index, dtype=object)).fillna("")
+    summary = monthly.groupby(["Fecha prevista de cobro", "Situación"], as_index=False).agg(
+        Cantidad=("Importe", "size"),
+        Importe=("Importe", "sum"),
+        Clientes=("Cliente", lambda values: values[values.ne("")].nunique()),
+    )
+    return summary[columns].sort_values("Fecha prevista de cobro").reset_index(drop=True)
 
 
 def receipt_summary(portfolio: pd.DataFrame) -> pd.DataFrame:

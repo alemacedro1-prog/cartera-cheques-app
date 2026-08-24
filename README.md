@@ -6,17 +6,17 @@ El recibo relacionado se obtiene exclusivamente de `Observación` y `Nro Cpb Rel
 
 El filtro `Comprobante asociado` permite ver todos los movimientos, solamente los tomados o solamente los que siguen sin recibo asociado. Se aplica al resumen, el detalle, la calidad de vínculos y la exportación filtrada.
 
-El resumen ejecutivo presenta los rechazados con dos lecturas directas: barras mensuales con importe y cantidad, y un ranking horizontal de clientes por importe rechazado. El detalle mensual informa cantidad, importe total y promedio, y respeta todos los filtros activos.
+La portada está orientada a la decisión gerencial: muestra el importe pendiente de cobro del mes, los próximos siete días, los vencidos sin cobrar y el saldo pendiente total. La lectura rápida informa qué proporción del saldo corresponde al mes y cuánto concentran los tres principales clientes.
 
-Los vencimientos se muestran como un flujo semanal de los próximos 90 días, con cantidad, importe y clientes en el detalle interactivo. La exposición por cliente usa un ranking horizontal de los diez principales saldos de cartera, con participación porcentual, para facilitar la lectura de concentración.
+El calendario de cobros usa `Fecha acreditación` y, cuando no está informada, `Fecha vencimiento`. El gráfico diario distingue fechas futuras de fechas ya cumplidas. La exposición por cliente usa un ranking horizontal de los diez mayores saldos pendientes.
 
-El panel lateral separa la carga, el estado de cartera, los comprobantes y los filtros operativos en secciones independientes. La planilla `Reportes` permite descargar un PDF completo —resumen ejecutivo y detalle de todos los instrumentos— y un Excel de la vista filtrada.
+El panel lateral separa la carga, la vista del detalle, los comprobantes y los filtros operativos. Las secciones principales son `Cobros del mes`, `Detalle de cheques`, `Rescatados y rechazados`, `Control de recibos` y `Reportes`.
 
 La app trabaja únicamente con el archivo activo de la sesión. Al descartarlo, cerrar la sesión o reiniciarse el servidor, la información deja de estar disponible. Los reportes PDF y Excel se generan bajo demanda para descarga y no se conservan en la aplicación.
 
-Para el estado de la cartera, el código del sistema es la fuente de verdad: únicamente `RE` y `RC` se clasifican como rechazados. `PS` se muestra como `Pendiente de acreditación`, aunque la fila conserve un código o motivo de rechazo informativo.
+Para el estado de la cartera, el código del sistema es la fuente de verdad: `RE` significa `Rescatado`, `RC` significa `Rechazado`, `PS` se muestra como `Pendiente de acreditación` y `AC` como `Acreditado`. Un RE nunca se suma a los importes rechazados.
 
-El código `PS` se normaliza aunque llegue con minúsculas, espacios, puntos, barras o una descripción adjunta. La vista `Pend. acreditación` filtra directamente ese código y muestra la cantidad detectada en el archivo junto con la cantidad visible después de aplicar los demás filtros.
+Los códigos se normalizan aunque lleguen con minúsculas, espacios, puntos, barras o una descripción adjunta. La vista `Pendientes del mes` incluye únicamente cheques que todavía representan un cobro y cuya fecha prevista pertenece al mes de la fecha de análisis.
 
 ## Seguridad y privacidad
 

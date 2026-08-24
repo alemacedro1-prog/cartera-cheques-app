@@ -197,21 +197,29 @@ def test_ps_variants_are_normalized(raw_state):
     assert result["Estado calculado"] == "Pendiente de acreditación"
 
 
-@pytest.mark.parametrize("system_state", ["RE", "RC"])
-def test_only_rejected_system_states_are_rejected(system_state):
-    result = build_portfolio(pd.DataFrame([row(**{"MCR-Estado instr.": system_state})]), date(2026, 8, 18)).iloc[0]
+def test_re_is_rescued_and_not_rejected():
+    result = build_portfolio(pd.DataFrame([row(**{"MCR-Estado instr.": "RE"})]), date(2026, 8, 18)).iloc[0]
+    assert result["Estado calculado"] == "Rescatado"
+    assert "RESCATADO" in result["Alertas"]
+    assert "RECHAZADO" not in result["Alertas"]
+
+
+def test_only_rc_is_rejected():
+    result = build_portfolio(pd.DataFrame([row(**{"MCR-Estado instr.": "RC"})]), date(2026, 8, 18)).iloc[0]
     assert result["Estado calculado"] == "Rechazado"
+    assert "RECHAZADO" in result["Alertas"]
 
 
 def test_ps_amount_is_excluded_from_rejected_total():
     frame = pd.DataFrame([
-        row(**{"MCR-Estado instr.": "RE", "MCR-Importe instr.": 24_803_810.71, "Fila fuente": 2}),
+        row(**{"MCR-Estado instr.": "RC", "MCR-Importe instr.": 24_803_810.71, "Fila fuente": 2}),
+        row(**{"MCR-Estado instr.": "RE", "MCR-Importe instr.": 7_500_000, "Fila fuente": 3}),
         row(**{
             "MCR-Estado instr.": "PS",
             "MCR-Importe instr.": 124_196_189.29,
             "MCR-Código rechazo": "R1",
             "MCR-Motivo rechazo": "Dato histórico",
-            "Fila fuente": 3,
+            "Fila fuente": 4,
         }),
     ])
 
@@ -219,7 +227,22 @@ def test_ps_amount_is_excluded_from_rejected_total():
     rejected_total = portfolio.loc[portfolio["Estado calculado"].eq("Rechazado"), "Importe"].sum()
 
     assert rejected_total == pytest.approx(24_803_810.71)
+    assert portfolio.loc[portfolio["Código estado"].eq("RE"), "Estado calculado"].item() == "Rescatado"
     assert portfolio.loc[portfolio["Código estado"].eq("PS"), "Estado calculado"].item() == "Pendiente de acreditación"
+
+
+def test_expected_collection_date_prefers_accreditation_and_falls_back_to_due_date():
+    frame = pd.DataFrame([
+        row(**{"MCR-Fecha acredit.": "22/08/2026", "MCR-Fecha vencim.": "20/08/2026", "Fila fuente": 2}),
+        row(**{"MCR-Fecha acredit.": None, "MCR-Fecha vencim.": "25/08/2026", "Fila fuente": 3}),
+    ])
+
+    result = build_portfolio(frame, date(2026, 8, 18))
+
+    assert result.iloc[0]["Fecha prevista de cobro"] == pd.Timestamp("2026-08-22")
+    assert result.iloc[0]["Días al cobro"] == 4
+    assert result.iloc[1]["Fecha prevista de cobro"] == pd.Timestamp("2026-08-25")
+    assert result.iloc[1]["Días al cobro"] == 7
 
 
 def test_rejected_monthly_summary_groups_by_client_and_uses_date_fallback():
@@ -275,6 +298,8 @@ def test_export_is_filtered_and_neutralizes_formulas():
     cartera = pd.read_excel(BytesIO(exported), sheet_name="Cartera")
     source = pd.read_excel(BytesIO(exported), sheet_name="Datos fuente filtrados")
     indicators = summary.set_index("Indicador")["Valor"]
+    assert indicators["Pendiente de cobro del mes"] == 1000
+    assert indicators["Cheques pendientes del mes"] == 1
     assert indicators["Cheques con recibo"] == 1
     assert indicators["Cheques sin recibo"] == 0
     assert indicators["Importe con recibo"] == 1000

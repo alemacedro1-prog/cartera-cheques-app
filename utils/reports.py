@@ -65,7 +65,7 @@ def _page_header_footer(canvas, document, cutoff: date) -> None:
     canvas.drawString(document.leftMargin, page_height - 8.2 * mm, "CARTERA DE CHEQUES")
     canvas.setFont("Helvetica", 7)
     canvas.setFillColor(MUTED)
-    canvas.drawRightString(page_width - document.rightMargin, page_height - 8.2 * mm, f"Fecha de corte: {cutoff:%d/%m/%Y}")
+    canvas.drawRightString(page_width - document.rightMargin, page_height - 8.2 * mm, f"Fecha de análisis: {cutoff:%d/%m/%Y}")
     canvas.line(document.leftMargin, 11 * mm, page_width - document.rightMargin, 11 * mm)
     canvas.drawString(document.leftMargin, 7.2 * mm, "Reporte generado por Cartera de cheques")
     canvas.drawRightString(page_width - document.rightMargin, 7.2 * mm, f"Página {document.page}")
@@ -157,7 +157,7 @@ def export_portfolio_pdf(portfolio: pd.DataFrame, cutoff: date) -> bytes:
         rightMargin=12 * mm,
         topMargin=22 * mm,
         bottomMargin=15 * mm,
-        title=f"Cartera de cheques {cutoff:%Y-%m-%d}",
+        title=f"Posición de cobro de cheques {cutoff:%Y-%m-%d}",
         author="Cartera de cheques",
         subject="Reporte completo de cartera",
     )
@@ -168,14 +168,22 @@ def export_portfolio_pdf(portfolio: pd.DataFrame, cutoff: date) -> bytes:
     in_portfolio_states = ["Pendiente", "Pendiente de acreditación", "Vencido", "Vence hoy"]
     total_amount = float(amounts.sum())
     in_portfolio_amount = float(amounts[states.isin(in_portfolio_states)].sum())
+    rescued_amount = float(amounts[states.eq("Rescatado")].sum())
     rejected_amount = float(amounts[states.eq("Rechazado")].sum())
+    expected_dates = pd.to_datetime(
+        portfolio.get("Fecha prevista de cobro", pd.Series(pd.NaT, index=portfolio.index)), dayfirst=True, errors="coerce"
+    )
+    month_start = pd.Timestamp(cutoff).to_period("M").to_timestamp()
+    month_end = month_start + pd.offsets.MonthEnd(0)
+    pending_month = states.isin(in_portfolio_states) & expected_dates.between(month_start, month_end, inclusive="both")
+    pending_month_amount = float(amounts[pending_month].sum())
     linked_count = int(portfolio.get("Estado recibo", pd.Series(index=portfolio.index, dtype=object)).eq("Tomado").sum())
 
     story = []
     hero = Table(
         [[
-            Paragraph("Cartera de cheques", title_style),
-            Paragraph(f"Reporte profesional completo<br/>Corte al {cutoff:%d/%m/%Y}", subtitle_style),
+            Paragraph("Posición de cobro de cheques", title_style),
+            Paragraph(f"Resumen ejecutivo y detalle completo<br/>Posición al {cutoff:%d/%m/%Y}", subtitle_style),
         ]],
         colWidths=[160 * mm, 88 * mm],
     )
@@ -192,15 +200,15 @@ def export_portfolio_pdf(portfolio: pd.DataFrame, cutoff: date) -> bytes:
 
     metric_data = [
         [
-            Paragraph("INSTRUMENTOS", metric_label_style),
-            Paragraph("IMPORTE TOTAL", metric_label_style),
-            Paragraph("EN CARTERA", metric_label_style),
-            Paragraph("RECHAZADOS", metric_label_style),
+            Paragraph("PENDIENTE DEL MES", metric_label_style),
+            Paragraph("PENDIENTE TOTAL", metric_label_style),
+            Paragraph("RESCATADOS (RE)", metric_label_style),
+            Paragraph("RECHAZADOS (RC)", metric_label_style),
         ],
         [
-            Paragraph(f"{len(portfolio):,}".replace(",", "."), metric_value_style),
-            Paragraph(_currency(total_amount), metric_value_style),
+            Paragraph(_currency(pending_month_amount), metric_value_style),
             Paragraph(_currency(in_portfolio_amount), metric_value_style),
+            Paragraph(_currency(rescued_amount), metric_value_style),
             Paragraph(_currency(rejected_amount), metric_value_style),
         ],
     ]
@@ -254,7 +262,8 @@ def export_portfolio_pdf(portfolio: pd.DataFrame, cutoff: date) -> bytes:
         Spacer(1, 4 * mm),
         Paragraph(
             f"Cobertura de comprobantes: <b>{linked_count:,}</b> de <b>{len(portfolio):,}</b> instrumentos ({coverage:.1f}%). ".replace(",", ".")
-            + "Los importes y estados surgen del archivo procesado para la fecha de corte indicada.",
+            + f"Importe total del archivo: <b>{_currency(total_amount)}</b>. "
+            + "La fecha prevista de cobro usa acreditación y, si no está informada, vencimiento.",
             body_style,
         ),
     ])
@@ -263,16 +272,16 @@ def export_portfolio_pdf(portfolio: pd.DataFrame, cutoff: date) -> bytes:
     story.extend([
         Paragraph("Detalle completo de instrumentos", section_style),
         Paragraph(
-            "El listado incluye todos los movimientos de la cartera, ordenados por vencimiento y cliente. Los guiones indican datos no informados en el archivo fuente.",
+            "El listado incluye todos los movimientos de la cartera, ordenados por fecha prevista de cobro y cliente. Los guiones indican datos no informados en el archivo fuente.",
             body_style,
         ),
         Spacer(1, 3 * mm),
     ])
-    headers = ["#", "Cliente", "Tipo", "Cheque / eCheq", "Banco", "Importe", "Ingreso", "Vencimiento", "Estado", "Recibo", "Alertas"]
+    headers = ["#", "Cliente", "Tipo", "Cheque / eCheq", "Banco", "Importe", "Cobro previsto", "Vencimiento", "Estado", "Recibo", "Alertas"]
     detail_rows = [[Paragraph(header, header_cell_style) for header in headers]]
     ordered = portfolio.copy()
-    ordered["_orden_vencimiento"] = pd.to_datetime(ordered.get("Fecha vencimiento"), errors="coerce")
-    ordered = ordered.sort_values(["_orden_vencimiento", "Cliente"], na_position="last")
+    ordered["_orden_cobro"] = pd.to_datetime(ordered.get("Fecha prevista de cobro"), dayfirst=True, errors="coerce")
+    ordered = ordered.sort_values(["_orden_cobro", "Cliente"], na_position="last")
     for position, (_, row) in enumerate(ordered.iterrows(), start=1):
         detail_rows.append([
             Paragraph(str(position), cell_center_style),
@@ -281,7 +290,7 @@ def export_portfolio_pdf(portfolio: pd.DataFrame, cutoff: date) -> bytes:
             _paragraph(row.get("N° cheque / eCheq"), cell_center_style),
             _paragraph(row.get("Banco cheque"), cell_style),
             Paragraph(_currency(row.get("Importe")), cell_right_style),
-            Paragraph(_date_text(row.get("Fecha ingreso / pago")), cell_center_style),
+            Paragraph(_date_text(row.get("Fecha prevista de cobro")), cell_center_style),
             Paragraph(_date_text(row.get("Fecha vencimiento")), cell_center_style),
             _paragraph(row.get("Estado calculado"), cell_style),
             _paragraph(row.get("Recibo relacionado"), cell_style),

@@ -13,8 +13,10 @@ from openpyxl.utils import get_column_letter
 
 ALLOWED_TYPES = ("CH24", "CH48", "CPD", "ECHEQ", "ECHEQDIF")
 BANK_FILTER_OPTIONS = ("Macro", "Galicia", "Nación")
-REJECTED_STATES = {"RE", "RC"}
+REJECTED_STATES = {"RC"}
+RESCUED_STATES = {"RE"}
 PENDING_ACCREDITATION_STATES = {"PS"}
+PENDING_COLLECTION_STATES = ("Pendiente", "Pendiente de acreditación", "Vencido", "Vence hoy")
 MAX_FILE_BYTES = 15 * 1024 * 1024
 MAX_UNCOMPRESSED_BYTES = 150 * 1024 * 1024
 MAX_ROWS = 100_000
@@ -193,11 +195,16 @@ def build_portfolio(raw: pd.DataFrame, cutoff: date | pd.Timestamp | None = None
         entry_date = _date_value(_first(row, "MCR-Fecha pago", "Fecha Movimiento"))
         accreditation_date = _date_value(_first(row, "MCR-Fecha acredit.", "Fecha acreditación"))
         due_date = _date_value(row.get("MCR-Fecha vencim."))
+        expected_collection_date = accreditation_date if not pd.isna(accreditation_date) else due_date
         days_to_due = int((due_date - cutoff_ts).days) if not pd.isna(due_date) else pd.NA
+        days_to_collection = int((expected_collection_date - cutoff_ts).days) if not pd.isna(expected_collection_date) else pd.NA
         # El estado del sistema es la fuente de verdad. Código y motivo son
         # informativos y no convierten por sí solos un movimiento en rechazado.
+        rescued = original_state in RESCUED_STATES
         rejected = original_state in REJECTED_STATES
-        if rejected:
+        if rescued:
+            state = "Rescatado"
+        elif rejected:
             state = "Rechazado"
         elif original_state in PENDING_ACCREDITATION_STATES:
             state = "Pendiente de acreditación"
@@ -224,6 +231,7 @@ def build_portfolio(raw: pd.DataFrame, cutoff: date | pd.Timestamp | None = None
         else: bucket = ">60 días"
 
         alerts = []
+        if rescued: alerts.append("RESCATADO")
         if rejected: alerts.append("RECHAZADO")
         if state == "Pendiente de acreditación": alerts.append("PENDIENTE DE ACREDITACIÓN")
         if not receipt: alerts.append("SIN RECIBO ASOCIADO")
@@ -243,7 +251,8 @@ def build_portfolio(raw: pd.DataFrame, cutoff: date | pd.Timestamp | None = None
             "Cuenta cheque": _identifier(row.get("MCR-Cuenta de cheque")), "CUIT emisor": _identifier(row.get("MCR-CUIT emisor")),
             "Importe": float(amount) if not pd.isna(amount) else 0.0,
             "Fecha ingreso / pago": entry_date, "Fecha acreditación": accreditation_date,
-            "Fecha vencimiento": due_date, "Días al vencimiento": days_to_due, "Tramo vencimiento": bucket,
+            "Fecha vencimiento": due_date, "Fecha prevista de cobro": expected_collection_date,
+            "Días al cobro": days_to_collection, "Días al vencimiento": days_to_due, "Tramo vencimiento": bucket,
             "Estado recibo": "Tomado" if receipt else "Sin recibo asociado",
             "Recibo relacionado": receipt, "Fuente del vínculo": source,
             "Estado calculado": state, "Código estado": original_state, "Estado original": original_state_text,
@@ -311,17 +320,24 @@ def export_excel(portfolio: pd.DataFrame, raw: pd.DataFrame, cutoff: date) -> by
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         with_receipt = portfolio["Estado recibo"].eq("Tomado")
+        states = portfolio["Estado calculado"]
+        amounts = pd.to_numeric(portfolio["Importe"], errors="coerce").fillna(0)
+        pending = states.isin(PENDING_COLLECTION_STATES)
+        expected_dates = pd.to_datetime(portfolio.get("Fecha prevista de cobro"), dayfirst=True, errors="coerce")
+        month_start = pd.Timestamp(cutoff).to_period("M").to_timestamp()
+        month_end = month_start + pd.offsets.MonthEnd(0)
+        pending_month = pending & expected_dates.between(month_start, month_end, inclusive="both")
         summary = pd.DataFrame({
             "Indicador": [
-                "Fecha de corte", "Instrumentos", "Importe total", "En cartera (con recibo)",
-                "Cheques con recibo", "Importe con recibo", "Cheques sin recibo", "Importe sin recibo", "Rechazados",
+                "Fecha de análisis", "Instrumentos", "Importe total", "Pendiente total de cobro",
+                "Pendiente de cobro del mes", "Cheques pendientes del mes", "Rescatados (RE)", "Rechazados (RC)",
+                "Cheques con recibo", "Importe con recibo", "Cheques sin recibo", "Importe sin recibo",
             ],
             "Valor": [
-                pd.Timestamp(cutoff), len(portfolio), portfolio["Importe"].sum(),
-                portfolio.loc[with_receipt, "Importe"].sum(), int(with_receipt.sum()),
-                portfolio.loc[with_receipt, "Importe"].sum(), int((~with_receipt).sum()),
-                portfolio.loc[~with_receipt, "Importe"].sum(),
-                portfolio.loc[portfolio["Estado calculado"].eq("Rechazado"), "Importe"].sum(),
+                pd.Timestamp(cutoff), len(portfolio), amounts.sum(), amounts[pending].sum(),
+                amounts[pending_month].sum(), int(pending_month.sum()), amounts[states.eq("Rescatado")].sum(),
+                amounts[states.eq("Rechazado")].sum(), int(with_receipt.sum()), amounts[with_receipt].sum(),
+                int((~with_receipt).sum()), amounts[~with_receipt].sum(),
             ],
         })
         summary.to_excel(writer, sheet_name="Resumen", index=False)
@@ -337,7 +353,7 @@ def export_excel(portfolio: pd.DataFrame, raw: pd.DataFrame, cutoff: date) -> by
                 ws.column_dimensions[letter].width = min(max(max(map(len, sample), default=8) + 2, 11), 35)
         ws = writer.book["Cartera"]
         for cell in ws[get_column_letter(list(portfolio.columns).index("Importe") + 1)][1:]: cell.number_format = '$#,##0.00;[Red]($#,##0.00);-'
-        for name in ("Fecha ingreso / pago", "Fecha acreditación", "Fecha vencimiento"):
+        for name in ("Fecha ingreso / pago", "Fecha acreditación", "Fecha vencimiento", "Fecha prevista de cobro"):
             for cell in ws[get_column_letter(list(portfolio.columns).index(name) + 1)][1:]: cell.number_format = "dd/mm/yyyy"
     return output.getvalue()
 

@@ -4,13 +4,20 @@ import hashlib
 import logging
 import re
 import unicodedata
-from datetime import date, timedelta
+from datetime import date
 
 import altair as alt
 import pandas as pd
 import streamlit as st
 
-from utils.analytics import apply_operational_scope, receipt_summary, rejected_bank_summary
+from utils.analytics import (
+    apply_operational_scope,
+    collection_calendar_summary,
+    pending_collection,
+    pending_for_month,
+    receipt_summary,
+    rejected_bank_summary,
+)
 from utils.portfolio import (
     ALLOWED_TYPES,
     ConcentradorError,
@@ -31,8 +38,9 @@ from utils.security import (
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 LOGGER = logging.getLogger("cartera")
-PROCESSING_RULE_VERSION = "2026-08-19-receipts-cutoff-bank-stats-v6"
+PROCESSING_RULE_VERSION = "2026-08-24-management-collections-rescued-v7"
 BANK_FILTER_OPTIONS = ("Macro", "Galicia", "Nación")
+MONTH_NAMES = ("enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre")
 
 
 def bank_filter_group(value) -> str:
@@ -59,7 +67,7 @@ def bank_filter_group(value) -> str:
         return "Nación"
     return ""
 
-st.set_page_config(page_title="Cartera de cheques", page_icon=":material/account_balance_wallet:", layout="wide")
+st.set_page_config(page_title="Posición de cobro de cheques", page_icon=":material/account_balance_wallet:", layout="wide")
 
 
 def secret_section(name: str) -> dict:
@@ -90,7 +98,7 @@ def require_password_access() -> None:
                 st.rerun()
         return
 
-    st.title("Cartera de cheques")
+    st.title("Posición de cobro de cheques")
     st.caption("Ingresá con un usuario autorizado para acceder a la cartera.")
     with st.container(border=True):
         with st.form("password_login", clear_on_submit=False):
@@ -134,7 +142,7 @@ def require_access() -> None:
     except (AttributeError, KeyError):
         logged_in = False
     if not logged_in:
-        st.title("Cartera de cheques")
+        st.title("Posición de cobro de cheques")
         st.write("Ingresá con una cuenta autorizada para continuar.")
         if st.button("Ingresar", icon=":material/login:", type="primary"):
             st.login()
@@ -173,7 +181,14 @@ def make_pdf(portfolio: pd.DataFrame, cutoff: date) -> bytes:
     return export_portfolio_pdf(portfolio, cutoff)
 
 
-def donut_chart(data: pd.DataFrame, category: str, title: str, key: str, max_slices: int = 7) -> None:
+def donut_chart(
+    data: pd.DataFrame,
+    category: str,
+    title: str,
+    key: str,
+    max_slices: int = 7,
+    description: str | None = None,
+) -> None:
     grouped = data[[category, "Importe"]].copy()
     grouped[category] = grouped[category].fillna("").astype(str).str.strip().replace("", "Sin dato")
     grouped["Importe"] = pd.to_numeric(grouped["Importe"], errors="coerce").fillna(0).clip(lower=0)
@@ -223,46 +238,59 @@ def donut_chart(data: pd.DataFrame, category: str, title: str, key: str, max_sli
         labelColor=foreground, titleColor=foreground, labelFontSize=12
     )
     st.subheader(title)
+    if description:
+        st.caption(description)
     st.altair_chart(chart, key=key)
 
 
-def due_flow_chart(data: pd.DataFrame, cutoff: date) -> None:
-    st.subheader("Flujo de vencimientos")
-    st.caption("Importe a vencer por semana durante los próximos 90 días.")
-    cutoff_ts = pd.Timestamp(cutoff)
-    end_ts = cutoff_ts + pd.Timedelta(days=90)
-    due = data[data["Estado calculado"].isin(["Pendiente", "Vence hoy"])].copy()
-    due["Fecha vencimiento"] = pd.to_datetime(due["Fecha vencimiento"], errors="coerce")
-    due = due[due["Fecha vencimiento"].between(cutoff_ts, end_ts, inclusive="both")]
-    if due.empty:
-        st.info("No hay vencimientos previstos para los próximos 90 días.", icon=":material/event_available:")
+def monthly_collection_chart(data: pd.DataFrame, cutoff: date) -> None:
+    st.subheader("Cuándo debería entrar el dinero este mes")
+    st.caption(
+        "Cada barra muestra el importe todavía pendiente para una fecha. Se usa la fecha de acreditación y, si falta, el vencimiento."
+    )
+    calendar = collection_calendar_summary(data, cutoff)
+    if calendar.empty:
+        st.info("No hay cobros pendientes con fecha prevista dentro del mes analizado.", icon=":material/event_available:")
         return
 
-    due["Semana"] = due["Fecha vencimiento"] - pd.to_timedelta(due["Fecha vencimiento"].dt.weekday, unit="D")
-    weekly = due.groupby("Semana", as_index=False).agg(
-        Importe=("Importe", "sum"),
-        Instrumentos=("Importe", "size"),
-        Clientes=("Cliente", "nunique"),
-    )
-    weekly["Etiqueta"] = weekly["Instrumentos"].map(lambda value: f"{int(value)} chq.")
+    calendar["Etiqueta"] = calendar["Cantidad"].map(lambda value: f"{int(value)} chq.")
     dark_theme = st.context.theme.type == "dark"
     foreground = "#E7EEF8" if dark_theme else "#23364A"
     grid = "#2A3B53" if dark_theme else "#DCE5EE"
-    accent = "#67B7F7" if dark_theme else "#245A8D"
-    base = alt.Chart(weekly).encode(
-        x=alt.X("Semana:T", title="Semana de vencimiento", axis=alt.Axis(format="%d %b", labelAngle=-25)),
-        y=alt.Y("Importe:Q", title="Importe a vencer", axis=alt.Axis(format="$,.0s"), scale=alt.Scale(zero=True)),
+    colors = ["#67B7F7", "#FF8B86"] if dark_theme else ["#245A8D", "#C95651"]
+    base = alt.Chart(calendar).encode(
+        x=alt.X(
+            "Fecha prevista de cobro:T",
+            title="Fecha prevista de cobro",
+            axis=alt.Axis(format="%d/%m", labelAngle=-35),
+        ),
+        y=alt.Y(
+            "Importe:Q",
+            title="Importe pendiente",
+            axis=alt.Axis(format="$,.0s"),
+            scale=alt.Scale(zero=True),
+        ),
+        color=alt.Color(
+            "Situación:N",
+            title=None,
+            scale=alt.Scale(domain=["Próximo cobro", "Fecha ya cumplida"], range=colors),
+            legend=alt.Legend(orient="bottom", direction="horizontal", symbolType="circle"),
+        ),
     )
-    bars = base.mark_bar(color=accent, cornerRadiusTopLeft=7, cornerRadiusTopRight=7, size=34).encode(
+    bars = base.mark_bar(cornerRadiusTopLeft=7, cornerRadiusTopRight=7, size=32).encode(
         tooltip=[
-            alt.Tooltip("Semana:T", title="Semana", format="%d/%m/%Y"),
-            alt.Tooltip("Importe:Q", title="Importe", format="$,.2f"),
-            alt.Tooltip("Instrumentos:Q", title="Cheques", format=",.0f"),
+            alt.Tooltip("Fecha prevista de cobro:T", title="Cobro previsto", format="%d/%m/%Y"),
+            alt.Tooltip("Situación:N", title="Situación"),
+            alt.Tooltip("Importe:Q", title="Importe pendiente", format="$,.2f"),
+            alt.Tooltip("Cantidad:Q", title="Cheques", format=",.0f"),
             alt.Tooltip("Clientes:Q", title="Clientes", format=",.0f"),
         ]
     )
     labels = base.mark_text(color=foreground, dy=-10, fontSize=11, fontWeight=700).encode(text="Etiqueta:N")
-    chart = (bars + labels).properties(height=315).configure_view(stroke=None).configure_axis(
+    cutoff_rule = alt.Chart(pd.DataFrame({"Fecha": [pd.Timestamp(cutoff)]})).mark_rule(
+        color=foreground, strokeDash=[5, 4], opacity=0.55
+    ).encode(x="Fecha:T", tooltip=[alt.Tooltip("Fecha:T", title="Fecha de análisis", format="%d/%m/%Y")])
+    chart = (bars + labels + cutoff_rule).properties(height=340).configure_view(stroke=None).configure_axis(
         labelColor=foreground,
         titleColor=foreground,
         gridColor=grid,
@@ -270,13 +298,13 @@ def due_flow_chart(data: pd.DataFrame, cutoff: date) -> None:
         tickColor=grid,
         labelFontSize=11,
         titleFontSize=12,
-    )
+    ).configure_legend(labelColor=foreground, titleColor=foreground)
     st.altair_chart(chart, key="chart_due_flow")
 
 
 def client_exposure_chart(data: pd.DataFrame) -> None:
-    st.subheader("Exposición por cliente")
-    st.caption("Ranking de importes todavía expuestos en cartera.")
+    st.subheader("Clientes con mayor saldo pendiente")
+    st.caption("Muestra de quién depende la mayor parte del dinero que todavía falta cobrar.")
     active_states = ["Pendiente", "Pendiente de acreditación", "Vencido", "Vence hoy"]
     exposure = data[data["Estado calculado"].isin(active_states)].copy()
     exposure["Cliente"] = exposure["Cliente"].fillna("").astype(str).str.strip().replace("", "Sin cliente")
@@ -286,7 +314,7 @@ def client_exposure_chart(data: pd.DataFrame) -> None:
     )
     ranking = ranking[ranking["Importe"] > 0].sort_values("Importe", ascending=False)
     if ranking.empty:
-        st.info("No hay importes expuestos en la vista actual.", icon=":material/account_balance:")
+        st.info("No hay importes pendientes para comparar en la vista actual.", icon=":material/account_balance:")
         return
 
     total = float(ranking["Importe"].sum())
@@ -307,7 +335,7 @@ def client_exposure_chart(data: pd.DataFrame) -> None:
         ),
         x=alt.X(
             "Importe:Q",
-            title="Importe expuesto",
+            title="Importe pendiente de cobro",
             axis=alt.Axis(format="$,.0s"),
             scale=alt.Scale(domain=[0, ranking_max * 1.22]),
         ),
@@ -315,7 +343,7 @@ def client_exposure_chart(data: pd.DataFrame) -> None:
     bars = base.mark_bar(color=accent, cornerRadiusEnd=7, size=22).encode(
         tooltip=[
             alt.Tooltip("Cliente:N", title="Cliente"),
-            alt.Tooltip("Importe:Q", title="Importe expuesto", format="$,.2f"),
+            alt.Tooltip("Importe:Q", title="Importe pendiente", format="$,.2f"),
             alt.Tooltip("Instrumentos:Q", title="Instrumentos", format=",.0f"),
             alt.Tooltip("Participación:Q", title="Participación", format=".1%"),
         ]
@@ -339,7 +367,7 @@ def client_exposure_chart(data: pd.DataFrame) -> None:
     )
     st.altair_chart(chart, key="chart_client_exposure")
     if len(ranking) > len(visible):
-        st.caption("Se muestran los 10 clientes con mayor exposición.")
+        st.caption("Se muestran los 10 clientes con mayor saldo pendiente.")
 
 
 def receipt_coverage_chart(data: pd.DataFrame) -> None:
@@ -441,10 +469,60 @@ def receipt_coverage_chart(data: pd.DataFrame) -> None:
         )
 
 
+def rescued_client_chart(data: pd.DataFrame) -> None:
+    rescued = data[data["Estado calculado"].eq("Rescatado")].copy()
+    st.subheader("Cheques rescatados (RE)")
+    st.caption("Son cheques retirados o recuperados. No se consideran rechazados ni pendientes de cobro.")
+    if rescued.empty:
+        st.info("No hay cheques rescatados en los filtros actuales.", icon=":material/check_circle:")
+        return
+
+    rescued["Cliente"] = rescued["Cliente"].fillna("").astype(str).str.strip().replace("", "Sin cliente")
+    rescued["Importe"] = pd.to_numeric(rescued["Importe"], errors="coerce").fillna(0)
+    ranking = rescued.groupby("Cliente", as_index=False).agg(
+        Importe=("Importe", "sum"),
+        Cheques=("Importe", "size"),
+    ).sort_values("Importe", ascending=False)
+    visible = ranking.head(10).sort_values("Importe")
+    with st.container(horizontal=True):
+        st.metric("Cheques rescatados", f"{len(rescued):,}".replace(",", "."), border=True)
+        st.metric("Importe rescatado", format_currency(rescued["Importe"].sum()), border=True)
+        st.metric("Clientes involucrados", f"{rescued['Cliente'].nunique():,}".replace(",", "."), border=True)
+
+    dark_theme = st.context.theme.type == "dark"
+    foreground = "#E7EEF8" if dark_theme else "#23364A"
+    grid = "#2A3B53" if dark_theme else "#DCE5EE"
+    accent = "#F8C65A" if dark_theme else "#C48717"
+    maximum = max(float(visible["Importe"].max()), 1.0)
+    base = alt.Chart(visible).encode(
+        y=alt.Y("Cliente:N", title=None, sort=alt.SortField(field="Importe", order="descending")),
+        x=alt.X(
+            "Importe:Q",
+            title="Importe rescatado",
+            axis=alt.Axis(format="$,.0s"),
+            scale=alt.Scale(domain=[0, maximum * 1.25]),
+        ),
+    )
+    bars = base.mark_bar(color=accent, cornerRadiusEnd=7, size=24).encode(
+        tooltip=[
+            alt.Tooltip("Cliente:N", title="Cliente"),
+            alt.Tooltip("Cheques:Q", title="Cheques rescatados", format=",.0f"),
+            alt.Tooltip("Importe:Q", title="Importe rescatado", format="$,.2f"),
+        ]
+    )
+    labels = base.mark_text(
+        align="left", baseline="middle", dx=8, color=foreground, fontSize=11, fontWeight=700
+    ).encode(text=alt.Text("Importe:Q", format="$,.0s"))
+    chart = (bars + labels).properties(height=max(230, len(visible) * 34)).configure_view(stroke=None).configure_axis(
+        labelColor=foreground, titleColor=foreground, gridColor=grid, domainColor=grid, tickColor=grid
+    )
+    st.altair_chart(chart, key="chart_rescued_clients")
+
+
 def rejected_bank_chart(data: pd.DataFrame) -> None:
     summary = rejected_bank_summary(data)
-    st.subheader("Rechazados por banco")
-    st.caption("Estadísticas exclusivas de Banco Macro, Galicia y Nación.")
+    st.subheader("Cheques rechazados (RC) por banco")
+    st.caption("Incluye únicamente código RC. Los cheques RE se muestran como rescatados en otra sección.")
     if summary.empty:
         st.info("No hay cheques rechazados de estos tres bancos en la vista actual.", icon=":material/account_balance:")
         return
@@ -518,8 +596,8 @@ def rejected_bank_chart(data: pd.DataFrame) -> None:
 
 def rejected_trend_chart(data: pd.DataFrame) -> None:
     monthly = rejected_monthly_summary(data)
-    st.subheader("Rechazados: cuándo y quiénes")
-    st.caption("Las barras muestran importes; las etiquetas indican la cantidad de cheques rechazados.")
+    st.subheader("Rechazados (RC): evolución y clientes")
+    st.caption("Muestra cuándo ocurrieron los rechazos y qué clientes concentran el mayor importe.")
     if monthly.empty:
         st.info("No hay rechazos con fecha disponible en la vista actual.", icon=":material/info:")
         return
@@ -664,39 +742,39 @@ def rejected_trend_chart(data: pd.DataFrame) -> None:
 
 require_access()
 with st.container(horizontal=True, vertical_alignment="center"):
-    st.title("Cartera de cheques")
-    st.badge("Procesamiento privado", icon=":material/shield_lock:", color="blue")
+    st.title("Posición de cobro de cheques")
+    st.badge("Información privada", icon=":material/shield_lock:", color="blue")
 st.caption(
-    "Cargá el CONRENPF para obtener la cartera operativa. El Excel se procesa en memoria y no queda guardado en la aplicación."
+    "Muestra cuánto dinero sigue pendiente de cobro, cuándo debería acreditarse y qué clientes concentran el saldo."
 )
 
 with st.sidebar:
-    st.header("Panel de control")
+    st.header("Panel de análisis")
     st.caption(":material/contrast: Tema claro u oscuro desde el menú ⋮.")
-    with st.expander("Archivo y fecha de corte", icon=":material/upload_file:", expanded=True):
+    with st.expander("Archivo y fecha de análisis", icon=":material/upload_file:", expanded=True):
         uploaded = st.file_uploader(
-            "Archivo del concentrador",
+            "Archivo de cartera",
             type=["xlsx", "xlsm"],
             max_upload_size=15,
             help="Excel original del CONRENPF. Máximo 15 MB.",
             key="source_file",
         )
         cutoff = st.date_input(
-            "Fecha de corte / acreditación",
+            "Fecha de análisis",
             value=date.today(),
             format="DD/MM/YYYY",
-            help="Se considera acreditado todo cheque cuya fecha de acreditación sea igual o anterior a este corte.",
+            help="La aplicación muestra la posición de la cartera a esta fecha y toma su mes como período principal de cobro.",
         )
-        st.caption("La cartera se recalcula completa al mover esta fecha.")
+        st.caption("Un cheque se considera acreditado cuando su fecha de acreditación es igual o anterior a la fecha de análisis.")
         if uploaded is not None and st.button("Descartar archivo", icon=":material/delete:", width="stretch"):
             st.cache_data.clear(); st.session_state.pop("source_file", None); st.rerun()
 
 if uploaded is None:
     with st.container(border=True):
-        st.subheader("Empezar")
-        st.write("Seleccioná el archivo del concentrador desde el panel lateral.")
+        st.subheader("Cargar la cartera")
+        st.write("Seleccioná el Excel desde el panel lateral para calcular la posición de cobro.")
         st.info(
-            "Incluye CH24, CH48, CPD, ECHEQ y ECHEQDIF. No modifica ni guarda el Excel original.",
+            "La aplicación incluye CH24, CH48, CPD, ECHEQ y ECHEQDIF. Procesa el archivo en memoria y no modifica el original.",
             icon=":material/info:",
         )
     st.stop()
@@ -719,22 +797,27 @@ if portfolio.empty:
     st.warning("El archivo no contiene instrumentos compatibles."); st.stop()
 
 with st.sidebar:
-    with st.expander("Estado de la cartera", icon=":material/account_balance_wallet:", expanded=True):
+    with st.expander("Movimientos para detalle y Excel", icon=":material/account_balance_wallet:", expanded=True):
         scope = st.selectbox(
-            "Vista",
-            ["Todos", "En cartera", "Pend. acreditación", "Rechazados", "Acreditados"],
+            "Qué movimientos mostrar",
+            [
+                "Pendientes del mes",
+                "Todos los pendientes",
+                "Pendientes de acreditación",
+                "Todos los movimientos",
+                "Acreditados (AC)",
+                "Rescatados (RE)",
+                "Rechazados (RC)",
+            ],
             key="portfolio_scope",
         )
+        st.caption("Afecta el detalle en pantalla y el Excel filtrado. La portada siempre resume los cobros pendientes.")
     with st.expander("Comprobantes", icon=":material/receipt_long:", expanded=False):
-        if scope == "En cartera":
-            receipt_scope = "Con comprobante asociado"
-            st.info("En cartera muestra todos los cheques con recibo, estén acreditados o no.", icon=":material/receipt_long:")
-        else:
-            receipt_scope = st.selectbox(
-                "Comprobante asociado",
-                ["Todos", "Con comprobante asociado", "Sin comprobante asociado"],
-                key="receipt_filter",
-            )
+        receipt_scope = st.selectbox(
+            "Recibo asociado",
+            ["Todos", "Con comprobante asociado", "Sin comprobante asociado"],
+            key="receipt_filter",
+        )
     with st.expander("Filtros operativos", icon=":material/filter_alt:", expanded=False):
         selected_types = st.pills("Tipos", list(ALLOWED_TYPES), default=list(ALLOWED_TYPES), selection_mode="multi")
         selected_clients = st.multiselect("Clientes", sorted(x for x in portfolio["Cliente"].dropna().unique() if x), placeholder="Todos")
@@ -745,93 +828,166 @@ with st.sidebar:
             help="Filtro operativo limitado a Banco Macro, Galicia y Nación.",
         )
         search = st.text_input("Buscar cheque, CUIT o recibo", placeholder="Número o texto")
+    with st.expander("Guía de estados", icon=":material/help:", expanded=False):
+        st.markdown(
+            "**AC · Acreditado** — el dinero ya fue acreditado.  \n"
+            "**PS · Pendiente de acreditación** — el cheque todavía no se acreditó.  \n"
+            "**RE · Rescatado** — el cheque fue retirado o recuperado; no es un rechazo.  \n"
+            "**RC · Rechazado** — el banco rechazó el cheque."
+        )
 
-filtered = apply_operational_scope(portfolio, scope)
-if receipt_scope == "Con comprobante asociado": filtered = filtered[filtered["Estado recibo"].eq("Tomado")]
-elif receipt_scope == "Sin comprobante asociado": filtered = filtered[filtered["Estado recibo"].eq("Sin recibo asociado")]
-filtered = filtered[filtered["Tipo"].isin(selected_types)] if selected_types else filtered.iloc[0:0]
-if selected_clients: filtered = filtered[filtered["Cliente"].isin(selected_clients)]
+base_filtered = portfolio.copy()
+if receipt_scope == "Con comprobante asociado": base_filtered = base_filtered[base_filtered["Estado recibo"].eq("Tomado")]
+elif receipt_scope == "Sin comprobante asociado": base_filtered = base_filtered[base_filtered["Estado recibo"].eq("Sin recibo asociado")]
+base_filtered = base_filtered[base_filtered["Tipo"].isin(selected_types)] if selected_types else base_filtered.iloc[0:0]
+if selected_clients: base_filtered = base_filtered[base_filtered["Cliente"].isin(selected_clients)]
 if selected_banks:
-    filtered = filtered[filtered["Banco cheque"].map(bank_filter_group).isin(selected_banks)]
+    base_filtered = base_filtered[base_filtered["Banco cheque"].map(bank_filter_group).isin(selected_banks)]
 if search.strip():
     needle = search.strip().casefold()
-    searchable = filtered[["Cliente", "CUIT cliente", "N° cheque / eCheq", "Recibo relacionado"]].fillna("").astype(str).agg(" ".join, axis=1).str.casefold()
-    filtered = filtered[searchable.str.contains(needle, regex=False)]
+    searchable = base_filtered[["Cliente", "CUIT cliente", "N° cheque / eCheq", "Recibo relacionado"]].fillna("").astype(str).agg(" ".join, axis=1).str.casefold()
+    base_filtered = base_filtered[searchable.str.contains(needle, regex=False)]
 
-in_portfolio = filtered[filtered["Estado recibo"].eq("Tomado")]
-rejected = filtered[filtered["Estado calculado"].eq("Rechazado")]
-next_7 = filtered[filtered["Estado calculado"].isin(["Pendiente", "Vence hoy"]) & filtered["Días al vencimiento"].between(0, 7, inclusive="both")]
+filtered = apply_operational_scope(base_filtered, scope, cutoff)
+pending_all = pending_collection(base_filtered)
+pending_month = pending_for_month(base_filtered, cutoff)
+expected_dates = pd.to_datetime(pending_all["Fecha prevista de cobro"], dayfirst=True, errors="coerce")
+cutoff_ts = pd.Timestamp(cutoff)
+next_7 = pending_all[expected_dates.between(cutoff_ts, cutoff_ts + pd.Timedelta(days=7), inclusive="both")]
+overdue = pending_all[expected_dates < cutoff_ts]
+without_collection_date = pending_all[expected_dates.isna()]
+pending_amount = float(pending_all["Importe"].sum())
+month_amount = float(pending_month["Importe"].sum())
+month_label = f"{MONTH_NAMES[cutoff.month - 1]} {cutoff.year}"
+
 with st.container(horizontal=True):
-    st.metric("Importe total", format_currency(filtered["Importe"].sum()), border=True)
-    st.metric("En cartera", format_currency(in_portfolio["Importe"].sum()), border=True)
-    st.metric("Próximos 7 días", format_currency(next_7["Importe"].sum()), border=True)
-    st.metric("Rechazados", format_currency(rejected["Importe"].sum()), border=True)
-with_receipt = filtered[filtered["Estado recibo"].eq("Tomado")]
-without_receipt = filtered[filtered["Estado recibo"].ne("Tomado")]
-total_count = len(filtered)
-receipt_coverage = len(with_receipt) / total_count if total_count else 0.0
-amount_total = float(filtered["Importe"].sum())
-receipt_amount_share = float(with_receipt["Importe"].sum()) / amount_total if amount_total else 0.0
-with st.container(horizontal=True):
-    st.metric(f"Total · {total_count:,} cheques".replace(",", "."), format_currency(amount_total), border=True)
-    st.metric(f"Con recibo · {len(with_receipt):,} cheques".replace(",", "."), format_currency(with_receipt["Importe"].sum()), border=True)
-    st.metric(f"Sin recibo · {len(without_receipt):,} cheques".replace(",", "."), format_currency(without_receipt["Importe"].sum()), border=True)
-    st.metric(f"Cobertura · {receipt_amount_share:.1%} del importe", f"{receipt_coverage:.1%}", border=True)
-st.caption(f":material/data_check: {len(filtered):,} instrumentos incluidos en la vista actual.".replace(",", "."))
-st.caption(f":material/event_available: Acreditación calculada al **{cutoff:%d/%m/%Y}**.")
-if scope == "Pend. acreditación":
-    ps_in_file = int(portfolio["Código estado"].eq("PS").sum())
-    pending_at_cutoff = int(portfolio["Estado calculado"].eq("Pendiente de acreditación").sum())
-    st.caption(
-        f":material/pending_actions: Pendientes según el corte: **{pending_at_cutoff:,}** · "
-        f"código PS en el archivo: **{ps_in_file:,}** · visibles con los demás filtros: **{len(filtered):,}**".replace(",", ".")
-    )
+    st.metric(f"A cobrar en {month_label} · {len(pending_month):,} chq.".replace(",", "."), format_currency(month_amount), border=True)
+    st.metric(f"Próximos 7 días · {len(next_7):,} chq.".replace(",", "."), format_currency(next_7["Importe"].sum()), border=True)
+    st.metric(f"Vencidos sin cobrar · {len(overdue):,} chq.".replace(",", "."), format_currency(overdue["Importe"].sum()), border=True)
+    st.metric(f"Pendiente total · {len(pending_all):,} chq.".replace(",", "."), format_currency(pending_amount), border=True)
+st.caption(
+    f":material/event_available: Posición calculada al **{cutoff:%d/%m/%Y}**. "
+    "Los indicadores respetan comprobantes, tipos, clientes, bancos y búsqueda."
+)
+
+with st.container(border=True):
+    st.markdown("**Lectura rápida para gerencia**")
+    if pending_all.empty:
+        st.write("No quedan cheques pendientes de cobro con los filtros actuales.")
+    else:
+        month_share = month_amount / pending_amount if pending_amount else 0.0
+        client_amounts = pending_month.groupby("Cliente")["Importe"].sum().sort_values(ascending=False)
+        top_three_share = float(client_amounts.head(3).sum()) / month_amount if month_amount else 0.0
+        message = (
+            f"El mes de **{month_label}** concentra **{month_share:.1%}** del saldo pendiente. "
+            f"Los tres clientes con mayor importe representan **{top_three_share:.1%}** de lo previsto para el mes."
+        )
+        if not overdue.empty:
+            message += f" Además, hay **{format_currency(overdue['Importe'].sum())}** con fecha de cobro ya cumplida."
+        if not without_collection_date.empty:
+            message += f" Hay **{len(without_collection_date):,} cheques** sin fecha prevista y requieren revisión.".replace(",", ".")
+        st.write(message)
 
 view = st.segmented_control(
-    "Planilla",
-    ["Resumen ejecutivo", "Detalle", "Calidad de vínculos", "Reportes"],
-    default="Resumen ejecutivo",
+    "Sección",
+    ["Cobros del mes", "Detalle de cheques", "Rescatados y rechazados", "Control de recibos", "Reportes"],
+    default="Cobros del mes",
 )
-if view == "Resumen ejecutivo":
-    left, right = st.columns(2)
+if view == "Cobros del mes":
+    with st.container(border=True):
+        monthly_collection_chart(base_filtered, cutoff)
+    left, right = st.columns([1.2, 1])
     with left, st.container(border=True, height="stretch"):
-        donut_chart(filtered, "Tipo", "Importe por tipo", "chart_type")
+        client_exposure_chart(pending_month)
     with right, st.container(border=True, height="stretch"):
-        donut_chart(filtered, "Estado calculado", "Importe por estado", "chart_state")
+        donut_chart(
+            pending_month,
+            "Estado calculado",
+            "Por qué siguen pendientes",
+            "chart_pending_state",
+            description="Separa pendientes normales, pendientes de acreditación y fechas vencidas.",
+        )
+    st.subheader(f"Cheques que deberían cobrarse en {month_label}")
+    st.caption("Listado ordenado por fecha prevista de cobro. Sirve para decidir qué cheques conviene conservar o negociar.")
+    if pending_month.empty:
+        st.info("No hay cheques pendientes previstos para este mes.", icon=":material/event_available:")
+    else:
+        monthly_detail = pending_month.sort_values(["Fecha prevista de cobro", "Importe"], ascending=[True, False])
+        st.dataframe(
+            monthly_detail[["Fecha prevista de cobro", "Cliente", "Tipo", "N° cheque / eCheq", "Banco cheque", "Importe", "Estado calculado", "Estado recibo"]],
+            hide_index=True,
+            column_config={
+                "Fecha prevista de cobro": st.column_config.DateColumn("Cobro previsto", format="DD/MM/YYYY", pinned=True),
+                "Cliente": st.column_config.TextColumn(pinned=True),
+                "Importe": st.column_config.NumberColumn(format="$ %.2f"),
+                "Estado calculado": st.column_config.TextColumn("Situación"),
+                "Estado recibo": st.column_config.TextColumn("Recibo"),
+            },
+            height=420,
+            key="monthly_collection_table",
+        )
+    if not without_collection_date.empty:
+        st.warning(
+            f"Hay {len(without_collection_date):,} cheques pendientes sin fecha prevista de cobro; no aparecen en el calendario mensual.".replace(",", "."),
+            icon=":material/warning:",
+        )
+elif view == "Detalle de cheques":
+    st.subheader("Detalle de movimientos")
+    st.caption(
+        f"Vista seleccionada: **{scope}** · mostrando {len(filtered):,} de {len(base_filtered):,} movimientos después de aplicar los filtros.".replace(",", ".")
+    )
+    columns = ["Estado calculado", "Fecha prevista de cobro", "Días al cobro", "Cliente", "Importe", "Tipo", "N° cheque / eCheq", "Banco cheque", "Fecha acreditación", "Fecha vencimiento", "Código estado", "Estado recibo", "Recibo relacionado", "Fuente del vínculo", "Nro Cpb Relación", "Observaciones", "Código rechazo", "Motivo rechazo", "Alertas", "Fila fuente"]
+    st.dataframe(
+        filtered[columns],
+        hide_index=True,
+        column_config={
+            "Estado calculado": st.column_config.TextColumn("Situación", pinned=True),
+            "Fecha prevista de cobro": st.column_config.DateColumn("Cobro previsto", format="DD/MM/YYYY", pinned=True),
+            "Días al cobro": st.column_config.NumberColumn(format="%d"),
+            "Cliente": st.column_config.TextColumn(pinned=True),
+            "Importe": st.column_config.NumberColumn(format="$ %.2f"),
+            "Fecha acreditación": st.column_config.DateColumn(format="DD/MM/YYYY"),
+            "Fecha vencimiento": st.column_config.DateColumn(format="DD/MM/YYYY"),
+        },
+        height=650,
+        key="portfolio_detail_table",
+    )
+elif view == "Rescatados y rechazados":
+    st.info(
+        "RE significa **rescatado** y no se suma a los rechazos. Solamente RC se considera **rechazado**.",
+        icon=":material/info:",
+    )
     with st.container(border=True):
-        receipt_coverage_chart(filtered)
-    left, right = st.columns(2)
-    with left, st.container(border=True, height="stretch"):
-        due_flow_chart(filtered, cutoff)
-    with right, st.container(border=True, height="stretch"):
-        client_exposure_chart(filtered)
+        rescued_client_chart(base_filtered)
     with st.container(border=True):
-        rejected_trend_chart(filtered)
+        rejected_bank_chart(base_filtered)
     with st.container(border=True):
-        rejected_bank_chart(filtered)
-    st.subheader("Próximos vencimientos")
-    next_due = filtered[filtered["Estado calculado"].isin(["Pendiente", "Vence hoy"]) & filtered["Fecha vencimiento"].between(pd.Timestamp(cutoff), pd.Timestamp(cutoff + timedelta(days=30)), inclusive="both")]
-    st.dataframe(next_due.sort_values(["Fecha vencimiento", "Importe"], ascending=[True, False])[["Fecha vencimiento", "Cliente", "Tipo", "N° cheque / eCheq", "Importe", "Estado calculado"]].head(25), hide_index=True,
-        column_config={"Fecha vencimiento": st.column_config.DateColumn("Vencimiento", format="DD/MM/YYYY"), "Importe": st.column_config.NumberColumn(format="$ %.2f")}, height=360)
-elif view == "Detalle":
-    st.caption(f"Mostrando {len(filtered):,} de {len(portfolio):,} instrumentos".replace(",", "."))
-    columns = ["Tipo", "Cliente", "CUIT cliente", "N° cheque / eCheq", "Banco cheque", "Importe", "Fecha ingreso / pago", "Fecha acreditación", "Fecha vencimiento", "Días al vencimiento", "Código estado", "Estado original", "Estado calculado", "Estado recibo", "Recibo relacionado", "Fuente del vínculo", "Nro Cpb Relación", "Observaciones", "Código rechazo", "Motivo rechazo", "Alertas", "Fila fuente"]
-    st.dataframe(filtered[columns], hide_index=True, column_config={"Cliente": st.column_config.TextColumn(pinned=True), "Importe": st.column_config.NumberColumn(format="$ %.2f"), "Fecha ingreso / pago": st.column_config.DateColumn(format="DD/MM/YYYY"), "Fecha acreditación": st.column_config.DateColumn(format="DD/MM/YYYY"), "Fecha vencimiento": st.column_config.DateColumn(format="DD/MM/YYYY")}, height=620)
-elif view == "Calidad de vínculos":
-    linked = filtered[filtered["Recibo relacionado"].ne("")]
-    missing = filtered[filtered["Recibo relacionado"].eq("")]
+        rejected_trend_chart(base_filtered)
+elif view == "Control de recibos":
+    linked = base_filtered[base_filtered["Recibo relacionado"].ne("")]
+    missing = base_filtered[base_filtered["Recibo relacionado"].eq("")]
     with st.container(horizontal=True):
-        st.metric("Tomados", len(linked), border=True)
-        st.metric("Sin recibo asociado", len(missing), border=True)
-        st.metric("Desde observación", len(linked[linked["Fuente del vínculo"].eq("Observación")]), border=True)
-        st.metric("Desde comprobante", len(linked[linked["Fuente del vínculo"].eq("Nro Cpb Relación")]), border=True)
+        st.metric("Con recibo identificado", len(linked), border=True)
+        st.metric("Sin recibo identificado", len(missing), border=True)
+        st.metric("Detectados en observaciones", len(linked[linked["Fuente del vínculo"].eq("Observación")]), border=True)
+        st.metric("Detectados por relación", len(linked[linked["Fuente del vínculo"].eq("Nro Cpb Relación")]), border=True)
+    with st.container(border=True):
+        receipt_coverage_chart(base_filtered)
     left, right = st.columns([1, 1.25])
     with left, st.container(border=True, height="stretch"):
-        donut_chart(linked, "Fuente del vínculo", "Origen de los recibos", "chart_receipt_source", max_slices=4)
+        donut_chart(
+            linked,
+            "Fuente del vínculo",
+            "Dónde se encontró el recibo",
+            "chart_receipt_source",
+            max_slices=4,
+            description="Indica si el número surgió de la observación o del comprobante relacionado.",
+        )
     with right, st.container(border=True, height="stretch"):
-        st.subheader("Instrumentos sin recibo asociado")
+        st.subheader("Cheques sin recibo identificado")
+        st.caption("Estos movimientos necesitan revisión porque no se encontró un número de recibo o comprobante asociado.")
         if missing.empty:
-            st.success("Todos los instrumentos tienen un recibo vinculado.", icon=":material/check_circle:")
+            st.success("Todos los cheques tienen un recibo identificado.", icon=":material/check_circle:")
         else:
             st.dataframe(
                 missing[["Cliente", "Tipo", "N° cheque / eCheq", "Nro Cpb Relación", "Observaciones", "Fila fuente"]],
@@ -839,12 +995,12 @@ elif view == "Calidad de vínculos":
                 height=430,
             )
 else:
-    st.subheader("Centro de reportes")
-    st.caption("Documentos preparados a partir del archivo procesado, sin modificar el original.")
+    st.subheader("Descargar reportes")
+    st.caption("Generá documentos para compartir la posición completa o trabajar con la vista filtrada.")
     pdf_column, excel_column = st.columns(2)
     with pdf_column, st.container(border=True, height="stretch"):
-        st.markdown("### :material/picture_as_pdf: Cartera completa en PDF")
-        st.write("Portada ejecutiva, composición por estado y detalle de todos los instrumentos.")
+        st.markdown("### :material/picture_as_pdf: Posición completa en PDF")
+        st.write("Resumen ejecutivo de cobros, composición por estado y detalle de todos los cheques.")
         st.caption(f"Incluye {len(portfolio):,} movimientos, sin aplicar los filtros de pantalla.".replace(",", "."))
         pdf_report = make_pdf(portfolio, cutoff)
         st.download_button(
@@ -857,8 +1013,8 @@ else:
             width="stretch",
         )
     with excel_column, st.container(border=True, height="stretch"):
-        st.markdown("### :material/table_view: Vista filtrada en Excel")
-        st.write("Planilla operativa con los filtros actuales y las filas fuente relacionadas.")
+        st.markdown("### :material/table_view: Movimientos filtrados en Excel")
+        st.write("Planilla operativa con la vista seleccionada y las filas fuente relacionadas.")
         st.caption(f"Incluye {len(filtered):,} de {len(portfolio):,} movimientos.".replace(",", "."))
         excel_report = make_excel(filtered, raw, cutoff)
         st.download_button(
