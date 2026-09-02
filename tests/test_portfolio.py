@@ -210,6 +210,50 @@ def test_only_rc_is_rejected():
     assert "RECHAZADO" in result["Alertas"]
 
 
+@pytest.mark.parametrize("raw_state", ["RC", "rc ", "R.C.", "R/C", "RC - rechazado", "Rechazado"])
+def test_rejected_state_variants_are_normalized(raw_state):
+    result = build_portfolio(
+        pd.DataFrame([row(**{"MCR-Estado instr.": raw_state})]), date(2026, 8, 18)
+    ).iloc[0]
+
+    assert result["Estado calculado"] == "Rechazado"
+    assert "RECHAZADO" in result["Alertas"]
+
+
+def test_missing_state_uses_code_and_reason_together_as_rejection_fallback():
+    result = build_portfolio(pd.DataFrame([row(**{
+        "MCR-Estado instr.": "",
+        "Estado": "",
+        "MCR-Código rechazo": "R10",
+        "MCR-Motivo rechazo": "FALTA DE FONDOS",
+    })]), date(2026, 8, 18)).iloc[0]
+
+    assert result["Estado calculado"] == "Rechazado"
+    assert result["Fuente clasificación"] == "Código y motivo de rechazo"
+
+
+def test_re_is_rescued_even_when_rejection_code_and_reason_exist():
+    result = build_portfolio(pd.DataFrame([row(**{
+        "MCR-Estado instr.": "RE",
+        "MCR-Código rechazo": "R97",
+        "MCR-Motivo rechazo": "CPD CON FECHA ADELANTADA",
+    })]), date(2026, 8, 18)).iloc[0]
+
+    assert result["Estado calculado"] == "Rescatado"
+    assert result["Fuente clasificación"] == "Estado RE / rescatado"
+    assert "RECHAZADO" not in result["Alertas"]
+
+
+def test_alternate_estado_field_can_supply_rc_when_mcr_state_is_blank():
+    result = build_portfolio(pd.DataFrame([row(**{
+        "MCR-Estado instr.": "",
+        "Estado": "R.C.",
+    })]), date(2026, 8, 18)).iloc[0]
+
+    assert result["Código estado"] == "RC"
+    assert result["Estado calculado"] == "Rechazado"
+
+
 def test_ps_amount_is_excluded_from_rejected_total():
     frame = pd.DataFrame([
         row(**{"MCR-Estado instr.": "RC", "MCR-Importe instr.": 24_803_810.71, "Fila fuente": 2}),

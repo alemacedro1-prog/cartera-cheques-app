@@ -1,8 +1,10 @@
-# Cartera de cheques
+# Control de cobranzas
 
-Aplicación privada en Streamlit para transformar un CONRENPF en cartera operativa, dashboard, controles de recibos y reportes profesionales en PDF y Excel.
+Aplicación privada en Streamlit que carga un único CONRENPF y ofrece dos módulos: `Cartera de cheques` y `Control de movimientos y recibos`.
 
-El recibo relacionado se obtiene exclusivamente de `Observación` y `Nro Cpb Relación`. Un número con formato de recibo dentro de la observación, por ejemplo `819-591309`, tiene prioridad y queda marcado como `Tomado`. También se reconoce como recibo interno de cobranza cualquier secuencia numérica de tres o más dígitos que comience con `75`, sin límite máximo de longitud; por ejemplo `756699` o `756701`. Si no aparece ninguno, se usa el comprobante de relación. `MCR-Número de recibo` no participa en el vínculo ni en controles de cobranza, y se omite junto con `Nro Cpb Relacionado` de los Excel exportados. El archivo original nunca se modifica.
+En la cartera de cheques, el recibo relacionado se obtiene exclusivamente de `Observación` y `Nro Cpb Relación`. Un número con formato de recibo dentro de la observación, por ejemplo `819-591309`, tiene prioridad y queda marcado como `Tomado`. También se reconoce como recibo interno de cobranza cualquier secuencia numérica de tres o más dígitos que comience con `75`, sin límite máximo de longitud; por ejemplo `756699` o `756701`. Si no aparece ninguno, se usa el comprobante de relación. `MCR-Número de recibo` no participa en el vínculo de cheques. El archivo original nunca se modifica.
+
+El módulo de movimientos excluye CH24, CH48, CPD, ECHEQ y ECHEQDIF, y analiza efectivo, transferencias, depósitos y cualquier otro medio informado. Para estos medios compara `Observación`, `Nro Cpb Relación`, comprobantes relacionados tipificados y `MCR-Número de recibo`. La prioridad cambia según el medio; si dos fuentes aportan números incompatibles, el movimiento queda `A revisar` y conserva todas las señales para auditoría.
 
 El filtro `Comprobante asociado` permite ver todos los movimientos, solamente los tomados o solamente los que siguen sin recibo asociado. Se aplica al resumen, el detalle, la calidad de vínculos y la exportación filtrada.
 
@@ -14,7 +16,9 @@ El panel lateral separa la carga, la vista del detalle, los comprobantes y los f
 
 La app trabaja únicamente con el archivo activo de la sesión. Al descartarlo, cerrar la sesión o reiniciarse el servidor, la información deja de estar disponible. Los reportes PDF y Excel se generan bajo demanda para descarga y no se conservan en la aplicación.
 
-Para el estado de la cartera, el código del sistema es la fuente de verdad: `RE` significa `Rescatado`, `RC` significa `Rechazado`, `PS` se muestra como `Pendiente de acreditación` y `AC` como `Acreditado`. Un RE nunca se suma a los importes rechazados.
+Para el estado de la cartera, `RE` significa `Rescatado`, `RC` significa `Rechazado`, `PS` se muestra como `Pendiente de acreditación` y `AC` como `Acreditado`. Un RE nunca se suma a los importes rechazados, aunque conserve código y motivo históricos. Cuando falta un estado explícito, la app solo usa código y motivo de rechazo si ambos están informados y no contradicen un estado operativo.
+
+El resumen de rechazados destaca Macro, Galicia y Nación, pero conserva una categoría `Otros bancos` para que los KPIs, gráficos, PDF y Excel siempre reconcilien con el total general.
 
 Los códigos se normalizan aunque lleguen con minúsculas, espacios, puntos, barras o una descripción adjunta. La vista `Pendientes del mes` incluye únicamente cheques que todavía representan un cobro y cuya fecha prevista pertenece al mes de la fecha de análisis.
 
@@ -44,7 +48,7 @@ Sin `.streamlit/secrets.toml`, la app muestra una advertencia y funciona solo co
 .venv\Scripts\python.exe -m pytest -q
 ```
 
-Las pruebas usan exclusivamente datos sintéticos y cubren prioridades de recibo, extracción ECHEQ, discrepancias, estados, vencimientos, validación de carga, exportación y autorización.
+Las pruebas usan exclusivamente datos sintéticos y cubren reglas de recibo por medio de pago, fuentes incompatibles, extracción ECHEQ, variantes RC/RE, bancos fuera del foco, vencimientos, validación de carga, exportación y autorización.
 
 ## Despliegue recomendado: Streamlit Community Cloud
 

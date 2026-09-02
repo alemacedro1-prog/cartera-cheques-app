@@ -100,7 +100,7 @@ def receipt_summary(portfolio: pd.DataFrame) -> pd.DataFrame:
 
 
 def rejected_bank_summary(portfolio: pd.DataFrame) -> pd.DataFrame:
-    """Resume rechazos únicamente para Macro, Galicia y Nación."""
+    """Resume rechazos sin ocultar los bancos fuera del foco operativo."""
     columns = ["Banco", "Cantidad de rechazados", "Importe rechazado", "Importe promedio", "Clientes afectados"]
     if portfolio.empty or "Estado calculado" not in portfolio:
         return pd.DataFrame(columns=columns)
@@ -108,10 +108,11 @@ def rejected_bank_summary(portfolio: pd.DataFrame) -> pd.DataFrame:
     rejected = portfolio[portfolio["Estado calculado"].eq("Rechazado")].copy()
     if rejected.empty:
         return pd.DataFrame(columns=columns)
-    rejected["Banco"] = rejected.get("Banco cheque", pd.Series(index=rejected.index, dtype=object)).map(bank_filter_group)
-    rejected = rejected[rejected["Banco"].isin(BANK_FILTER_OPTIONS)].copy()
-    if rejected.empty:
-        return pd.DataFrame(columns=columns)
+    rejected["Banco"] = (
+        rejected.get("Banco cheque", pd.Series(index=rejected.index, dtype=object))
+        .map(bank_filter_group)
+        .replace("", "Otros bancos")
+    )
 
     amounts = rejected.get("Importe", pd.Series(0.0, index=rejected.index))
     rejected["Importe"] = pd.to_numeric(amounts, errors="coerce").fillna(0)
@@ -124,6 +125,8 @@ def rejected_bank_summary(portfolio: pd.DataFrame) -> pd.DataFrame:
             "Clientes afectados": ("Cliente", lambda values: values[values.ne("")].nunique()),
         }
     )
-    order = {bank: index for index, bank in enumerate(BANK_FILTER_OPTIONS)}
+    display_order = (*BANK_FILTER_OPTIONS, "Otros bancos")
+    summary = summary.set_index("Banco").reindex(display_order, fill_value=0).reset_index()
+    order = {bank: index for index, bank in enumerate(display_order)}
     summary["_orden"] = summary["Banco"].map(order)
     return summary.sort_values("_orden").drop(columns="_orden")[columns].reset_index(drop=True)

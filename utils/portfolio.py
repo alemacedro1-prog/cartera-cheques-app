@@ -80,6 +80,49 @@ def _system_state(value) -> tuple[str, str]:
     return original, original
 
 
+def _normalized_text(value) -> str:
+    text = unicodedata.normalize("NFKD", _clean(value))
+    return "".join(character for character in text if not unicodedata.combining(character)).upper()
+
+
+def classify_cheque_status(
+    original_state_text: str,
+    original_state: str,
+    rejection_code: str,
+    rejection_reason: str,
+    observation: str = "",
+    description: str = "",
+) -> tuple[bool, bool, str]:
+    """Clasifica rescatados y rechazados con señales auditables.
+
+    RE siempre prevalece como rescatado. RC y textos inequívocos de rechazo
+    prevalecen como rechazado. Código y motivo se usan juntos únicamente si
+    el archivo no aporta un estado operativo explícito que los contradiga.
+    """
+    state_text = _normalized_text(original_state_text)
+    context = " ".join(_normalized_text(value) for value in (observation, description))
+    code = _normalized_text(rejection_code)
+    reason = _normalized_text(rejection_reason)
+
+    if original_state in RESCUED_STATES or "RESCATAD" in state_text:
+        return False, True, "Estado RE / rescatado"
+    if original_state in REJECTED_STATES:
+        return True, False, "Estado RC"
+    if "RECHAZ" in state_text:
+        return True, False, "Estado textual de rechazo"
+
+    explicit_non_rejected = original_state in {"AC", "PS", "PE", "P"} or any(
+        token in state_text for token in ("ACREDIT", "PENDIENT", "PRESENTADO")
+    )
+    if explicit_non_rejected:
+        return False, False, f"Estado operativo {original_state or original_state_text}"
+    if "RECHAZ" in context and (code or reason):
+        return True, False, "Texto de rechazo y metadatos"
+    if code and reason:
+        return True, False, "Código y motivo de rechazo"
+    return False, False, "Estado operativo"
+
+
 def _date_value(value):
     if value is None or pd.isna(value) or value in (0, 60, "0", "60"):
         return pd.NaT
@@ -198,10 +241,14 @@ def build_portfolio(raw: pd.DataFrame, cutoff: date | pd.Timestamp | None = None
         expected_collection_date = accreditation_date if not pd.isna(accreditation_date) else due_date
         days_to_due = int((due_date - cutoff_ts).days) if not pd.isna(due_date) else pd.NA
         days_to_collection = int((expected_collection_date - cutoff_ts).days) if not pd.isna(expected_collection_date) else pd.NA
-        # El estado del sistema es la fuente de verdad. Código y motivo son
-        # informativos y no convierten por sí solos un movimiento en rechazado.
-        rescued = original_state in RESCUED_STATES
-        rejected = original_state in REJECTED_STATES
+        rejected, rescued, classification_source = classify_cheque_status(
+            original_state_text,
+            original_state,
+            rejection_code,
+            rejection_reason,
+            observation,
+            _clean(row.get("MCR-Descripción")),
+        )
         if rescued:
             state = "Rescatado"
         elif rejected:
@@ -256,7 +303,8 @@ def build_portfolio(raw: pd.DataFrame, cutoff: date | pd.Timestamp | None = None
             "Estado recibo": "Tomado" if receipt else "Sin recibo asociado",
             "Recibo relacionado": receipt, "Fuente del vínculo": source,
             "Estado calculado": state, "Código estado": original_state, "Estado original": original_state_text,
-            "Código rechazo": rejection_code, "Motivo rechazo": rejection_reason, "Observaciones": observation,
+            "Código rechazo": rejection_code, "Motivo rechazo": rejection_reason,
+            "Fuente clasificación": classification_source, "Observaciones": observation,
             "Alertas": " · ".join(alerts), "Nro Cpb Relación": cpb_relation,
             "Banco depósito": _clean(_first(row, "Nombre del banco", "MCR-Banco depósito")),
             "MCR-ID pago": _identifier(row.get("MCR-ID pago")), "MCR-ID instrumento": _identifier(row.get("MCR-ID instrumento")),
@@ -330,12 +378,15 @@ def export_excel(portfolio: pd.DataFrame, raw: pd.DataFrame, cutoff: date) -> by
         summary = pd.DataFrame({
             "Indicador": [
                 "Fecha de análisis", "Instrumentos", "Importe total", "Pendiente total de cobro",
-                "Pendiente de cobro del mes", "Cheques pendientes del mes", "Rescatados (RE)", "Rechazados (RC)",
+                "Pendiente de cobro del mes", "Cheques pendientes del mes",
+                "Cheques rescatados (RE)", "Importe rescatado (RE)",
+                "Cheques rechazados", "Importe rechazado",
                 "Cheques con recibo", "Importe con recibo", "Cheques sin recibo", "Importe sin recibo",
             ],
             "Valor": [
                 pd.Timestamp(cutoff), len(portfolio), amounts.sum(), amounts[pending].sum(),
-                amounts[pending_month].sum(), int(pending_month.sum()), amounts[states.eq("Rescatado")].sum(),
+                amounts[pending_month].sum(), int(pending_month.sum()), int(states.eq("Rescatado").sum()),
+                amounts[states.eq("Rescatado")].sum(), int(states.eq("Rechazado").sum()),
                 amounts[states.eq("Rechazado")].sum(), int(with_receipt.sum()), amounts[with_receipt].sum(),
                 int((~with_receipt).sum()), amounts[~with_receipt].sum(),
             ],

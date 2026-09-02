@@ -81,7 +81,7 @@ def test_receipt_summary_reports_counts_amounts_and_shares():
     assert summary.at["Con recibo", "Participación importe"] == 0.75
 
 
-def test_rejected_bank_summary_uses_only_macro_galicia_and_nacion():
+def test_rejected_bank_summary_keeps_focus_banks_and_preserves_others():
     portfolio = pd.DataFrame([
         {"Estado calculado": "Rechazado", "Banco cheque": "285", "Cliente": "A", "Importe": 1000},
         {"Estado calculado": "Rechazado", "Banco cheque": "Banco Macro", "Cliente": "B", "Importe": 500},
@@ -93,10 +93,11 @@ def test_rejected_bank_summary_uses_only_macro_galicia_and_nacion():
 
     summary = rejected_bank_summary(portfolio).set_index("Banco")
 
-    assert summary.index.tolist() == ["Macro", "Galicia", "Nación"]
+    assert summary.index.tolist() == ["Macro", "Galicia", "Nación", "Otros bancos"]
     assert summary.at["Macro", "Cantidad de rechazados"] == 2
     assert summary.at["Macro", "Importe rechazado"] == 1500
     assert summary.at["Macro", "Clientes afectados"] == 2
     assert summary.at["Galicia", "Importe rechazado"] == 2000
     assert summary.at["Nación", "Importe rechazado"] == 3000
-    assert summary["Importe rechazado"].sum() == 6500
+    assert summary.at["Otros bancos", "Importe rechazado"] == 9000
+    assert summary["Importe rechazado"].sum() == 15500

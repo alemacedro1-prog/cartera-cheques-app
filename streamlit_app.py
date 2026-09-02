@@ -18,6 +18,12 @@ from utils.analytics import (
     receipt_summary,
     rejected_bank_summary,
 )
+from utils.movements import (
+    MOVEMENT_LINK_STATES,
+    build_movement_control,
+    export_movements_excel,
+    movement_link_summary,
+)
 from utils.portfolio import (
     ALLOWED_TYPES,
     ConcentradorError,
@@ -38,7 +44,7 @@ from utils.security import (
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 LOGGER = logging.getLogger("cartera")
-PROCESSING_RULE_VERSION = "2026-08-24-management-collections-rescued-v7"
+PROCESSING_RULE_VERSION = "2026-09-02-movements-receipts-rejections-v8"
 BANK_FILTER_OPTIONS = ("Macro", "Galicia", "Nación")
 MONTH_NAMES = ("enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre")
 
@@ -67,7 +73,7 @@ def bank_filter_group(value) -> str:
         return "Nación"
     return ""
 
-st.set_page_config(page_title="Posición de cobro de cheques", page_icon=":material/account_balance_wallet:", layout="wide")
+st.set_page_config(page_title="Control de cobranzas", page_icon=":material/account_balance_wallet:", layout="wide")
 
 
 def secret_section(name: str) -> dict:
@@ -98,8 +104,8 @@ def require_password_access() -> None:
                 st.rerun()
         return
 
-    st.title("Posición de cobro de cheques")
-    st.caption("Ingresá con un usuario autorizado para acceder a la cartera.")
+    st.title("Control de cobranzas")
+    st.caption("Ingresá con un usuario autorizado para acceder al CONRENPF.")
     with st.container(border=True):
         with st.form("password_login", clear_on_submit=False):
             username = st.text_input("Usuario", autocomplete="username")
@@ -142,7 +148,7 @@ def require_access() -> None:
     except (AttributeError, KeyError):
         logged_in = False
     if not logged_in:
-        st.title("Posición de cobro de cheques")
+        st.title("Control de cobranzas")
         st.write("Ingresá con una cuenta autorizada para continuar.")
         if st.button("Ingresar", icon=":material/login:", type="primary"):
             st.login()
@@ -168,12 +174,18 @@ def require_access() -> None:
 @st.cache_data(ttl="15m", max_entries=4, show_spinner="Procesando el concentrador…", scope="session")
 def process_file(file_bytes: bytes, cutoff: date, rule_version: str):
     LOGGER.debug("Regla de procesamiento: %s", rule_version)
-    return portfolio_from_bytes(file_bytes, cutoff)
+    portfolio, raw = portfolio_from_bytes(file_bytes, cutoff)
+    return portfolio, build_movement_control(raw), raw
 
 
 @st.cache_data(ttl="5m", max_entries=2, show_spinner="Preparando el Excel…", scope="session")
 def make_excel(portfolio: pd.DataFrame, raw: pd.DataFrame, cutoff: date) -> bytes:
     return export_excel(portfolio, raw, cutoff)
+
+
+@st.cache_data(ttl="5m", max_entries=4, show_spinner="Preparando el Excel de movimientos…", scope="session")
+def make_movements_excel(movements: pd.DataFrame, raw: pd.DataFrame, cutoff: date) -> bytes:
+    return export_movements_excel(movements, raw, cutoff)
 
 
 @st.cache_data(ttl="10m", max_entries=2, show_spinner="Generando el PDF profesional…", scope="session")
@@ -521,30 +533,47 @@ def rescued_client_chart(data: pd.DataFrame) -> None:
 
 def rejected_bank_chart(data: pd.DataFrame) -> None:
     summary = rejected_bank_summary(data)
-    st.subheader("Cheques rechazados (RC) por banco")
-    st.caption("Incluye únicamente código RC. Los cheques RE se muestran como rescatados en otra sección.")
+    st.subheader("Cheques rechazados por banco girado")
+    st.caption(
+        "RC identifica un rechazo. Si el estado viene vacío, la app exige código y motivo compatibles; RE siempre permanece como rescatado."
+    )
     if summary.empty:
-        st.info("No hay cheques rechazados de estos tres bancos en la vista actual.", icon=":material/account_balance:")
+        st.info("No hay cheques rechazados en la vista actual.", icon=":material/account_balance:")
         return
 
     indexed = summary.set_index("Banco")
+    rejected_rows = data[data["Estado calculado"].eq("Rechazado")]
     with st.container(horizontal=True):
+        st.metric(
+            f"Total · {len(rejected_rows)} rechazados",
+            format_currency(rejected_rows["Importe"].sum()),
+            border=True,
+        )
         for bank in BANK_FILTER_OPTIONS:
             amount = float(indexed.at[bank, "Importe rechazado"]) if bank in indexed.index else 0.0
             count = int(indexed.at[bank, "Cantidad de rechazados"]) if bank in indexed.index else 0
             st.metric(f"{bank} · {count} rechazados", format_currency(amount), border=True)
 
+    other_count = int(indexed.at["Otros bancos", "Cantidad de rechazados"]) if "Otros bancos" in indexed.index else 0
+    other_amount = float(indexed.at["Otros bancos", "Importe rechazado"]) if "Otros bancos" in indexed.index else 0.0
+    if other_count:
+        st.caption(
+            f"Además hay **{other_count} rechazados** por **{format_currency(other_amount)}** de otros bancos; "
+            "se conservan para que el total general no pierda movimientos."
+        )
+
     dark_theme = st.context.theme.type == "dark"
     foreground = "#E7EEF8" if dark_theme else "#23364A"
     grid = "#2A3B53" if dark_theme else "#DCE5EE"
-    palette = ["#67B7F7", "#B99AF5", "#F8C65A"] if dark_theme else ["#245A8D", "#7957B8", "#C48717"]
+    display_order = [*BANK_FILTER_OPTIONS, "Otros bancos"]
+    palette = ["#67B7F7", "#B99AF5", "#F8C65A", "#9AA9BC"] if dark_theme else ["#245A8D", "#7957B8", "#C48717", "#65758B"]
     chart_data = summary.copy()
     chart_data["Etiqueta"] = chart_data.apply(
         lambda row: f"{format_currency(row['Importe rechazado'])} · {int(row['Cantidad de rechazados'])} chq.", axis=1
     )
     amount_max = max(float(chart_data["Importe rechazado"].max()), 1.0)
     base = alt.Chart(chart_data).encode(
-        y=alt.Y("Banco:N", title=None, sort=list(BANK_FILTER_OPTIONS)),
+        y=alt.Y("Banco:N", title=None, sort=display_order),
         x=alt.X(
             "Importe rechazado:Q",
             title="Importe rechazado",
@@ -554,7 +583,7 @@ def rejected_bank_chart(data: pd.DataFrame) -> None:
         color=alt.Color(
             "Banco:N",
             title=None,
-            scale=alt.Scale(domain=list(BANK_FILTER_OPTIONS), range=palette),
+            scale=alt.Scale(domain=display_order, range=palette),
             legend=None,
         ),
     )
@@ -740,12 +769,115 @@ def rejected_trend_chart(data: pd.DataFrame) -> None:
     st.caption("Mes según fecha de ingreso/pago; si falta, se usa vencimiento y luego acreditación.")
 
 
+def movement_link_chart(data: pd.DataFrame) -> None:
+    st.subheader("Cobertura de recibos")
+    st.caption("Compara el importe y la cantidad de movimientos conciliados, pendientes y con fuentes incompatibles.")
+    summary = movement_link_summary(data)
+    if summary.empty or int(summary["Cantidad"].sum()) == 0:
+        st.info("No hay movimientos para representar.", icon=":material/receipt_long:")
+        return
+    summary["Etiqueta"] = summary.apply(
+        lambda row: f"{format_currency(row['Importe'])} · {int(row['Cantidad'])} mov.", axis=1
+    )
+    dark_theme = st.context.theme.type == "dark"
+    foreground = "#E7EEF8" if dark_theme else "#23364A"
+    grid = "#2A3B53" if dark_theme else "#DCE5EE"
+    palette = ["#5DD39E", "#FF8B86", "#F8C65A"] if dark_theme else ["#2E8B70", "#C95651", "#C48717"]
+    amount_max = max(float(summary["Importe"].max()), 1.0)
+    base = alt.Chart(summary).encode(
+        y=alt.Y("Estado vínculo:N", title=None, sort=list(MOVEMENT_LINK_STATES)),
+        x=alt.X(
+            "Importe:Q",
+            title="Importe de movimientos",
+            axis=alt.Axis(format="$,.0s"),
+            scale=alt.Scale(domain=[0, amount_max * 1.35]),
+        ),
+        color=alt.Color(
+            "Estado vínculo:N",
+            title=None,
+            scale=alt.Scale(domain=list(MOVEMENT_LINK_STATES), range=palette),
+            legend=None,
+        ),
+    )
+    bars = base.mark_bar(cornerRadiusEnd=8, size=34).encode(
+        tooltip=[
+            alt.Tooltip("Estado vínculo:N", title="Estado"),
+            alt.Tooltip("Cantidad:Q", title="Movimientos", format=",.0f"),
+            alt.Tooltip("Importe:Q", title="Importe", format="$,.2f"),
+            alt.Tooltip("Participación importe:Q", title="Participación", format=".1%"),
+        ]
+    )
+    labels = base.mark_text(
+        align="left", baseline="middle", dx=8, color=foreground, fontSize=11, fontWeight=700
+    ).encode(text="Etiqueta:N")
+    chart = (bars + labels).properties(height=250).configure_view(stroke=None).configure_axis(
+        labelColor=foreground,
+        titleColor=foreground,
+        gridColor=grid,
+        domainColor=grid,
+        tickColor=grid,
+    )
+    st.altair_chart(chart, key="movement_link_chart")
+
+
+def movement_method_chart(data: pd.DataFrame) -> None:
+    st.subheader("Importe por medio de pago")
+    st.caption("Permite identificar qué medios concentran el volumen que debe controlarse.")
+    if data.empty:
+        st.info("No hay movimientos para comparar.", icon=":material/account_balance:")
+        return
+    grouped = data.copy()
+    grouped["Grupo medio de pago"] = grouped["Grupo medio de pago"].fillna("").replace("", "Otro")
+    grouped["Importe"] = pd.to_numeric(grouped["Importe"], errors="coerce").fillna(0)
+    grouped = grouped.groupby("Grupo medio de pago", as_index=False).agg(
+        Importe=("Importe", "sum"), Movimientos=("Importe", "size")
+    ).sort_values("Importe", ascending=False).head(12)
+    grouped["Etiqueta"] = grouped["Movimientos"].map(lambda value: f"{int(value)} mov.")
+    dark_theme = st.context.theme.type == "dark"
+    foreground = "#E7EEF8" if dark_theme else "#23364A"
+    grid = "#2A3B53" if dark_theme else "#DCE5EE"
+    accent = "#67B7F7" if dark_theme else "#245A8D"
+    amount_max = max(float(grouped["Importe"].max()), 1.0)
+    base = alt.Chart(grouped).encode(
+        y=alt.Y(
+            "Grupo medio de pago:N",
+            title=None,
+            sort=alt.SortField(field="Importe", order="descending"),
+            axis=alt.Axis(labelLimit=165),
+        ),
+        x=alt.X(
+            "Importe:Q",
+            title="Importe",
+            axis=alt.Axis(format="$,.0s"),
+            scale=alt.Scale(domain=[0, amount_max * 1.2]),
+        ),
+    )
+    bars = base.mark_bar(color=accent, cornerRadiusEnd=8, size=25).encode(
+        tooltip=[
+            alt.Tooltip("Grupo medio de pago:N", title="Medio"),
+            alt.Tooltip("Movimientos:Q", title="Movimientos", format=",.0f"),
+            alt.Tooltip("Importe:Q", title="Importe", format="$,.2f"),
+        ]
+    )
+    labels = base.mark_text(
+        align="left", baseline="middle", dx=7, color=foreground, fontSize=11, fontWeight=700
+    ).encode(text="Etiqueta:N")
+    chart = (bars + labels).properties(height=250).configure_view(stroke=None).configure_axis(
+        labelColor=foreground,
+        titleColor=foreground,
+        gridColor=grid,
+        domainColor=grid,
+        tickColor=grid,
+    )
+    st.altair_chart(chart, key="movement_method_chart")
+
+
 require_access()
 with st.container(horizontal=True, vertical_alignment="center"):
-    st.title("Posición de cobro de cheques")
+    st.title("Control de cobranzas")
     st.badge("Información privada", icon=":material/shield_lock:", color="blue")
 st.caption(
-    "Muestra cuánto dinero sigue pendiente de cobro, cuándo debería acreditarse y qué clientes concentran el saldo."
+    "Cargá el CONRENPF una sola vez para analizar la cartera de cheques y conciliar los demás movimientos con sus recibos."
 )
 
 with st.sidebar:
@@ -753,7 +885,7 @@ with st.sidebar:
     st.caption(":material/contrast: Tema claro u oscuro desde el menú ⋮.")
     with st.expander("Archivo y fecha de análisis", icon=":material/upload_file:", expanded=True):
         uploaded = st.file_uploader(
-            "Archivo de cartera",
+            "Archivo CONRENPF",
             type=["xlsx", "xlsm"],
             max_upload_size=15,
             help="Excel original del CONRENPF. Máximo 15 MB.",
@@ -771,10 +903,10 @@ with st.sidebar:
 
 if uploaded is None:
     with st.container(border=True):
-        st.subheader("Cargar la cartera")
-        st.write("Seleccioná el Excel desde el panel lateral para calcular la posición de cobro.")
+        st.subheader("Cargar el CONRENPF")
+        st.write("Seleccioná el Excel desde el panel lateral para habilitar ambos módulos.")
         st.info(
-            "La aplicación incluye CH24, CH48, CPD, ECHEQ y ECHEQDIF. Procesa el archivo en memoria y no modifica el original.",
+            "La cartera incluye CH24, CH48, CPD, ECHEQ y ECHEQDIF; el conciliador analiza los demás medios. El archivo se procesa en memoria y no se modifica.",
             icon=":material/info:",
         )
     st.stop()
@@ -784,7 +916,7 @@ file_digest = hashlib.sha256(file_bytes).hexdigest()
 file_fingerprint = file_digest[:12]
 LOGGER.info("Procesando archivo id=%s bytes=%d", file_fingerprint, len(file_bytes))
 try:
-    portfolio, raw = process_file(file_bytes, cutoff, PROCESSING_RULE_VERSION)
+    portfolio, movements, raw = process_file(file_bytes, cutoff, PROCESSING_RULE_VERSION)
 except ConcentradorError as error:
     st.error(str(error), icon=":material/error:"); st.stop()
 except Exception:
@@ -792,6 +924,186 @@ except Exception:
     st.error("No pude procesar el archivo. Confirmá que sea un CONRENPF válido y no protegido.", icon=":material/error:"); st.stop()
 finally:
     del file_bytes
+
+module = st.segmented_control(
+    "Módulo",
+    ["Cartera de cheques", "Control de movimientos y recibos"],
+    default="Cartera de cheques",
+    key="main_module",
+)
+st.caption(
+    f"El mismo CONRENPF alimenta ambos módulos: **{len(portfolio):,} cheques** y "
+    f"**{len(movements):,} movimientos no cheque** detectados.".replace(",", ".")
+)
+
+if module == "Control de movimientos y recibos":
+    st.header("Control de movimientos y recibos")
+    st.caption(
+        "Analiza efectivo, transferencias, depósitos y otros medios de pago. "
+        "Un movimiento queda ‘A revisar’ cuando las fuentes informan recibos incompatibles."
+    )
+    if movements.empty:
+        st.info(
+            "Este CONRENPF no contiene movimientos no cheque. La cartera de cheques sigue disponible en el otro módulo.",
+            icon=":material/info:",
+        )
+        st.stop()
+
+    available_dates = pd.to_datetime(movements["Fecha"], dayfirst=True, errors="coerce").dropna()
+    min_date = available_dates.min().date() if not available_dates.empty else cutoff
+    max_date = available_dates.max().date() if not available_dates.empty else cutoff
+    with st.sidebar:
+        with st.expander("Filtros del conciliador", icon=":material/filter_alt:", expanded=True):
+            selected_period = st.date_input(
+                "Período",
+                value=(min_date, max_date),
+                min_value=min_date,
+                max_value=max_date,
+                format="DD/MM/YYYY",
+                key="movement_period",
+            )
+            movement_clients = st.multiselect(
+                "Clientes",
+                sorted(value for value in movements["Cliente"].dropna().unique() if value),
+                placeholder="Todos",
+                key="movement_clients",
+            )
+            movement_methods = st.multiselect(
+                "Medios de pago",
+                sorted(value for value in movements["Grupo medio de pago"].dropna().unique() if value),
+                placeholder="Todos",
+                key="movement_methods",
+            )
+            movement_states = st.pills(
+                "Estado del recibo",
+                list(MOVEMENT_LINK_STATES),
+                default=list(MOVEMENT_LINK_STATES),
+                selection_mode="multi",
+                key="movement_states",
+            )
+            movement_search = st.text_input(
+                "Buscar cliente, CUIT, recibo u operación",
+                placeholder="Número o texto",
+                key="movement_search",
+            )
+        with st.expander("Cómo se vinculan los recibos", icon=":material/help:", expanded=False):
+            st.markdown(
+                "**Efectivo:** prioriza el número de recibo del movimiento.  \n"
+                "**Transferencias:** prioriza el comprobante de relación y la observación.  \n"
+                "**Depósitos:** prioriza el comprobante de relación y luego las referencias informadas.  \n"
+                "**A revisar:** dos o más fuentes muestran números diferentes."
+            )
+
+    movement_filtered = movements.copy()
+    if isinstance(selected_period, (tuple, list)) and len(selected_period) == 2:
+        start_date, end_date = map(pd.Timestamp, selected_period)
+        movement_dates = pd.to_datetime(movement_filtered["Fecha"], dayfirst=True, errors="coerce")
+        movement_filtered = movement_filtered[movement_dates.between(start_date, end_date, inclusive="both")]
+    if movement_clients:
+        movement_filtered = movement_filtered[movement_filtered["Cliente"].isin(movement_clients)]
+    if movement_methods:
+        movement_filtered = movement_filtered[movement_filtered["Grupo medio de pago"].isin(movement_methods)]
+    if movement_states:
+        movement_filtered = movement_filtered[movement_filtered["Estado vínculo"].isin(movement_states)]
+    else:
+        movement_filtered = movement_filtered.iloc[0:0]
+    if movement_search.strip():
+        needle = movement_search.strip().casefold()
+        searchable_columns = ["Cliente", "CUIT cliente", "Recibo relacionado", "N° operación", "Observación"]
+        searchable = (
+            movement_filtered[searchable_columns]
+            .fillna("")
+            .astype(str)
+            .agg(" ".join, axis=1)
+            .str.casefold()
+        )
+        movement_filtered = movement_filtered[searchable.str.contains(needle, regex=False)]
+
+    movement_summary = movement_link_summary(movement_filtered).set_index("Estado vínculo")
+    total_movement_amount = float(pd.to_numeric(movement_filtered["Importe"], errors="coerce").fillna(0).sum())
+    with st.container(horizontal=True):
+        st.metric(
+            f"Total · {len(movement_filtered):,} mov.".replace(",", "."),
+            format_currency(total_movement_amount),
+            border=True,
+        )
+        for state in MOVEMENT_LINK_STATES:
+            state_count = int(movement_summary.at[state, "Cantidad"]) if state in movement_summary.index else 0
+            state_amount = float(movement_summary.at[state, "Importe"]) if state in movement_summary.index else 0.0
+            st.metric(
+                f"{state} · {state_count:,} mov.".replace(",", "."),
+                format_currency(state_amount),
+                border=True,
+            )
+
+    left, right = st.columns(2)
+    with left, st.container(border=True, height="stretch"):
+        movement_link_chart(movement_filtered)
+    with right, st.container(border=True, height="stretch"):
+        movement_method_chart(movement_filtered)
+
+    st.subheader("Detalle de movimientos")
+    st.caption(
+        f"Se muestran {len(movement_filtered):,} de {len(movements):,} movimientos no cheque. "
+        "La fila de origen permite volver al registro exacto del CONRENPF.".replace(",", ".")
+    )
+    movement_columns = [
+        "Fecha",
+        "Cliente",
+        "CUIT cliente",
+        "Importe",
+        "Medio de pago",
+        "Grupo medio de pago",
+        "Banco / cuenta",
+        "Subcuenta",
+        "Estado vínculo",
+        "Recibo relacionado",
+        "Fuente del vínculo",
+        "Fuentes detectadas",
+        "Observación",
+        "Fila fuente",
+    ]
+    st.dataframe(
+        movement_filtered[movement_columns].sort_values(["Fecha", "Importe"], ascending=[False, False]),
+        hide_index=True,
+        height=590,
+        key="movement_detail_table",
+        column_config={
+            "Fecha": st.column_config.DateColumn(format="DD/MM/YYYY", pinned=True),
+            "Cliente": st.column_config.TextColumn(pinned=True),
+            "Importe": st.column_config.NumberColumn(format="$ %.2f"),
+            "Estado vínculo": st.column_config.TextColumn("Estado del recibo", pinned=True),
+        },
+    )
+
+    st.subheader("Exportar control de movimientos")
+    full_column, filtered_column = st.columns(2)
+    with full_column, st.container(border=True, height="stretch"):
+        st.markdown("### :material/table_view: Resultado completo")
+        st.write("Incluye todos los movimientos no cheque y sus filas fuente.")
+        complete_movement_excel = make_movements_excel(movements, raw, cutoff)
+        st.download_button(
+            "Descargar Excel completo",
+            data=complete_movement_excel,
+            file_name=f"control_movimientos_completo_{cutoff:%Y-%m-%d}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            icon=":material/download:",
+            type="primary",
+            width="stretch",
+        )
+    with filtered_column, st.container(border=True, height="stretch"):
+        st.markdown("### :material/filter_alt: Resultado filtrado")
+        st.write("Respeta el período, cliente, medio de pago, estado y búsqueda seleccionados.")
+        filtered_movement_excel = make_movements_excel(movement_filtered, raw, cutoff)
+        st.download_button(
+            "Descargar Excel filtrado",
+            data=filtered_movement_excel,
+            file_name=f"control_movimientos_filtrado_{cutoff:%Y-%m-%d}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            icon=":material/download:",
+            width="stretch",
+        )
+    st.stop()
 
 if portfolio.empty:
     st.warning("El archivo no contiene instrumentos compatibles."); st.stop()
@@ -936,7 +1248,7 @@ elif view == "Detalle de cheques":
     st.caption(
         f"Vista seleccionada: **{scope}** · mostrando {len(filtered):,} de {len(base_filtered):,} movimientos después de aplicar los filtros.".replace(",", ".")
     )
-    columns = ["Estado calculado", "Fecha prevista de cobro", "Días al cobro", "Cliente", "Importe", "Tipo", "N° cheque / eCheq", "Banco cheque", "Fecha acreditación", "Fecha vencimiento", "Código estado", "Estado recibo", "Recibo relacionado", "Fuente del vínculo", "Nro Cpb Relación", "Observaciones", "Código rechazo", "Motivo rechazo", "Alertas", "Fila fuente"]
+    columns = ["Estado calculado", "Fecha prevista de cobro", "Días al cobro", "Cliente", "Importe", "Tipo", "N° cheque / eCheq", "Banco cheque", "Fecha acreditación", "Fecha vencimiento", "Código estado", "Fuente clasificación", "Estado recibo", "Recibo relacionado", "Fuente del vínculo", "Nro Cpb Relación", "Observaciones", "Código rechazo", "Motivo rechazo", "Alertas", "Fila fuente"]
     st.dataframe(
         filtered[columns],
         hide_index=True,
@@ -954,7 +1266,7 @@ elif view == "Detalle de cheques":
     )
 elif view == "Rescatados y rechazados":
     st.info(
-        "RE significa **rescatado** y no se suma a los rechazos. Solamente RC se considera **rechazado**.",
+        "RE significa **rescatado** y nunca se suma a los rechazos. RC significa **rechazado**; cuando falta un estado explícito, la app solo clasifica como rechazo si coinciden código y motivo.",
         icon=":material/info:",
     )
     with st.container(border=True):

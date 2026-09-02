@@ -21,6 +21,8 @@ from reportlab.platypus import (
     TableStyle,
 )
 
+from utils.analytics import rejected_bank_summary
+
 
 NAVY = colors.HexColor("#17365D")
 BLUE = colors.HexColor("#245A8D")
@@ -170,6 +172,8 @@ def export_portfolio_pdf(portfolio: pd.DataFrame, cutoff: date) -> bytes:
     in_portfolio_amount = float(amounts[states.isin(in_portfolio_states)].sum())
     rescued_amount = float(amounts[states.eq("Rescatado")].sum())
     rejected_amount = float(amounts[states.eq("Rechazado")].sum())
+    rescued_count = int(states.eq("Rescatado").sum())
+    rejected_count = int(states.eq("Rechazado").sum())
     expected_dates = pd.to_datetime(
         portfolio.get("Fecha prevista de cobro", pd.Series(pd.NaT, index=portfolio.index)), dayfirst=True, errors="coerce"
     )
@@ -202,8 +206,8 @@ def export_portfolio_pdf(portfolio: pd.DataFrame, cutoff: date) -> bytes:
         [
             Paragraph("PENDIENTE DEL MES", metric_label_style),
             Paragraph("PENDIENTE TOTAL", metric_label_style),
-            Paragraph("RESCATADOS (RE)", metric_label_style),
-            Paragraph("RECHAZADOS (RC)", metric_label_style),
+            Paragraph(f"RESCATADOS (RE) · {rescued_count} CHQ.", metric_label_style),
+            Paragraph(f"RECHAZADOS · {rejected_count} CHQ.", metric_label_style),
         ],
         [
             Paragraph(_currency(pending_month_amount), metric_value_style),
@@ -256,6 +260,16 @@ def export_portfolio_pdf(portfolio: pd.DataFrame, cutoff: date) -> bytes:
         ("BOTTOMPADDING", (0, 0), (-1, -1), 2.2 * mm),
     ]))
     coverage = 100 * linked_count / len(portfolio) if len(portfolio) else 0
+    bank_rejections = rejected_bank_summary(portfolio)
+    bank_rejection_text = ""
+    if not bank_rejections.empty and rejected_count:
+        bank_parts = [
+            f"{row[0]}: {int(row[1])} ({_currency(row[2])})"
+            for row in bank_rejections.itertuples(index=False, name=None)
+            if int(row[1]) > 0
+        ]
+        if bank_parts:
+            bank_rejection_text = " Rechazos por banco girado: <b>" + "; ".join(bank_parts) + "</b>."
     summary_block = KeepTogether([
         Paragraph("Composición de la cartera", section_style),
         state_table,
@@ -263,7 +277,8 @@ def export_portfolio_pdf(portfolio: pd.DataFrame, cutoff: date) -> bytes:
         Paragraph(
             f"Cobertura de comprobantes: <b>{linked_count:,}</b> de <b>{len(portfolio):,}</b> instrumentos ({coverage:.1f}%). ".replace(",", ".")
             + f"Importe total del archivo: <b>{_currency(total_amount)}</b>. "
-            + "La fecha prevista de cobro usa acreditación y, si no está informada, vencimiento.",
+            + "La fecha prevista de cobro usa acreditación y, si no está informada, vencimiento."
+            + bank_rejection_text,
             body_style,
         ),
     ])
