@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import logging
 import re
 import unicodedata
@@ -18,16 +19,29 @@ from utils.analytics import (
     receipt_summary,
     rejected_bank_summary,
 )
-from utils.movements import (
-    CONTROL_RECORD_TYPES,
-    MOVEMENT_LINK_STATES,
-    RECONCILIATION_STATES,
-    build_movement_control,
-    export_movements_excel,
-    movement_link_summary,
-    movement_type_summary,
-    receipt_reconciliation,
+from utils import movements as movement_tools
+
+_MOVEMENT_API = (
+    "CONTROL_RECORD_TYPES",
+    "MOVEMENT_LINK_STATES",
+    "RECONCILIATION_STATES",
+    "build_movement_control",
+    "export_movements_excel",
+    "movement_link_summary",
+    "movement_type_summary",
+    "receipt_reconciliation",
 )
+if not all(hasattr(movement_tools, name) for name in _MOVEMENT_API):
+    movement_tools = importlib.reload(movement_tools)
+
+CONTROL_RECORD_TYPES = movement_tools.CONTROL_RECORD_TYPES
+MOVEMENT_LINK_STATES = movement_tools.MOVEMENT_LINK_STATES
+RECONCILIATION_STATES = movement_tools.RECONCILIATION_STATES
+build_movement_control = movement_tools.build_movement_control
+export_movements_excel = movement_tools.export_movements_excel
+movement_link_summary = movement_tools.movement_link_summary
+movement_type_summary = movement_tools.movement_type_summary
+receipt_reconciliation = movement_tools.receipt_reconciliation
 from utils.portfolio import (
     ALLOWED_TYPES,
     ConcentradorError,
