@@ -4,7 +4,11 @@ Aplicación privada en Streamlit que carga un único CONRENPF y ofrece dos módu
 
 En la cartera de cheques, el recibo relacionado se obtiene exclusivamente de `Observación` y `Nro Cpb Relación`. Un número con formato de recibo dentro de la observación, por ejemplo `819-591309`, tiene prioridad y queda marcado como `Tomado`. También se reconoce como recibo interno de cobranza cualquier secuencia numérica de tres o más dígitos que comience con `75`, sin límite máximo de longitud; por ejemplo `756699` o `756701`. Si no aparece ninguno, se usa el comprobante de relación. `MCR-Número de recibo` no participa en el vínculo de cheques. El archivo original nunca se modifica.
 
-El módulo de movimientos excluye CH24, CH48, CPD, ECHEQ y ECHEQDIF, y analiza efectivo, transferencias, depósitos y cualquier otro medio informado. Para estos medios compara `Observación`, `Nro Cpb Relación`, comprobantes relacionados tipificados y `MCR-Número de recibo`. La prioridad cambia según el medio; si dos fuentes aportan números incompatibles, el movimiento queda `A revisar` y conserva todas las señales para auditoría.
+El módulo de movimientos integra CH24, CH48, CPD, ECHEQ y ECHEQDIF con efectivo, transferencias, depósitos y cualquier otro medio informado. Cada fila queda identificada como `Cheque` o `Movimiento bancario`, permitiendo filtrar, comparar importes y revisar los vínculos con recibos en un único control. La brecha entre ambos grupos es orientativa y no se presenta como una conciliación automática uno a uno.
+
+Los cheques conservan la misma regla de recibos que la cartera. Para los demás medios se comparan `Observación`, `Nro Cpb Relación`, comprobantes relacionados tipificados y `MCR-Número de recibo`. La prioridad cambia según el medio; si dos fuentes aportan números incompatibles, el movimiento queda `A revisar` y conserva todas las señales para auditoría.
+
+El cruce por recibo suma los cheques y movimientos bancarios que comparten el mismo número normalizado. Informa si coinciden recibo e importe, si el importe es diferente o si el recibo aparece únicamente en uno de los dos grupos. Las filas sin recibo o con fuentes incompatibles se mantienen fuera del cruce y se contabilizan como pendientes de revisión.
 
 El filtro `Comprobante asociado` permite ver todos los movimientos, solamente los tomados o solamente los que siguen sin recibo asociado. Se aplica al resumen, el detalle, la calidad de vínculos y la exportación filtrada.
 
@@ -48,7 +52,7 @@ Sin `.streamlit/secrets.toml`, la app muestra una advertencia y funciona solo co
 .venv\Scripts\python.exe -m pytest -q
 ```
 
-Las pruebas usan exclusivamente datos sintéticos y cubren reglas de recibo por medio de pago, fuentes incompatibles, extracción ECHEQ, variantes RC/RE, bancos fuera del foco, vencimientos, validación de carga, exportación y autorización.
+Las pruebas usan exclusivamente datos sintéticos y cubren la integración de cheques y movimientos bancarios, reglas de recibo por medio de pago, fuentes incompatibles, extracción ECHEQ, variantes RC/RE, bancos fuera del foco, vencimientos, validación de carga, exportación y autorización.
 
 ## Despliegue recomendado: Streamlit Community Cloud
 

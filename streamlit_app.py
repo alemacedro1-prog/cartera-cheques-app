@@ -19,10 +19,14 @@ from utils.analytics import (
     rejected_bank_summary,
 )
 from utils.movements import (
+    CONTROL_RECORD_TYPES,
     MOVEMENT_LINK_STATES,
+    RECONCILIATION_STATES,
     build_movement_control,
     export_movements_excel,
     movement_link_summary,
+    movement_type_summary,
+    receipt_reconciliation,
 )
 from utils.portfolio import (
     ALLOWED_TYPES,
@@ -44,7 +48,7 @@ from utils.security import (
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 LOGGER = logging.getLogger("cartera")
-PROCESSING_RULE_VERSION = "2026-09-02-movements-receipts-rejections-v8"
+PROCESSING_RULE_VERSION = "2026-09-02-unified-cheques-movements-v9"
 BANK_FILTER_OPTIONS = ("Macro", "Galicia", "Nación")
 MONTH_NAMES = ("enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre")
 
@@ -175,7 +179,7 @@ def require_access() -> None:
 def process_file(file_bytes: bytes, cutoff: date, rule_version: str):
     LOGGER.debug("Regla de procesamiento: %s", rule_version)
     portfolio, raw = portfolio_from_bytes(file_bytes, cutoff)
-    return portfolio, build_movement_control(raw), raw
+    return portfolio, build_movement_control(raw, portfolio), raw
 
 
 @st.cache_data(ttl="5m", max_entries=2, show_spinner="Preparando el Excel…", scope="session")
@@ -771,13 +775,13 @@ def rejected_trend_chart(data: pd.DataFrame) -> None:
 
 def movement_link_chart(data: pd.DataFrame) -> None:
     st.subheader("Cobertura de recibos")
-    st.caption("Compara el importe y la cantidad de movimientos conciliados, pendientes y con fuentes incompatibles.")
+    st.caption("Compara cheques y movimientos bancarios con recibo, sin recibo o con fuentes incompatibles.")
     summary = movement_link_summary(data)
     if summary.empty or int(summary["Cantidad"].sum()) == 0:
         st.info("No hay movimientos para representar.", icon=":material/receipt_long:")
         return
     summary["Etiqueta"] = summary.apply(
-        lambda row: f"{format_currency(row['Importe'])} · {int(row['Cantidad'])} mov.", axis=1
+        lambda row: f"{format_currency(row['Importe'])} · {int(row['Cantidad'])} reg.", axis=1
     )
     dark_theme = st.context.theme.type == "dark"
     foreground = "#E7EEF8" if dark_theme else "#23364A"
@@ -788,7 +792,7 @@ def movement_link_chart(data: pd.DataFrame) -> None:
         y=alt.Y("Estado vínculo:N", title=None, sort=list(MOVEMENT_LINK_STATES)),
         x=alt.X(
             "Importe:Q",
-            title="Importe de movimientos",
+            title="Importe controlado",
             axis=alt.Axis(format="$,.0s"),
             scale=alt.Scale(domain=[0, amount_max * 1.35]),
         ),
@@ -802,7 +806,7 @@ def movement_link_chart(data: pd.DataFrame) -> None:
     bars = base.mark_bar(cornerRadiusEnd=8, size=34).encode(
         tooltip=[
             alt.Tooltip("Estado vínculo:N", title="Estado"),
-            alt.Tooltip("Cantidad:Q", title="Movimientos", format=",.0f"),
+            alt.Tooltip("Cantidad:Q", title="Registros", format=",.0f"),
             alt.Tooltip("Importe:Q", title="Importe", format="$,.2f"),
             alt.Tooltip("Participación importe:Q", title="Participación", format=".1%"),
         ]
@@ -820,9 +824,60 @@ def movement_link_chart(data: pd.DataFrame) -> None:
     st.altair_chart(chart, key="movement_link_chart")
 
 
+def movement_type_chart(data: pd.DataFrame) -> None:
+    st.subheader("Cartera vs. movimientos bancarios")
+    st.caption("Comparación bruta del importe del período; no implica una coincidencia automática entre registros.")
+    summary = movement_type_summary(data)
+    if summary.empty or int(summary["Cantidad"].sum()) == 0:
+        st.info("No hay registros para comparar.", icon=":material/compare_arrows:")
+        return
+    summary["Etiqueta"] = summary.apply(
+        lambda row: f"{format_currency(row['Importe'])} · {int(row['Cantidad'])} reg.", axis=1
+    )
+    dark_theme = st.context.theme.type == "dark"
+    foreground = "#E7EEF8" if dark_theme else "#23364A"
+    grid = "#2A3B53" if dark_theme else "#DCE5EE"
+    palette = ["#67B7F7", "#5DD39E"] if dark_theme else ["#245A8D", "#2E8B70"]
+    amount_max = max(float(summary["Importe"].max()), 1.0)
+    base = alt.Chart(summary).encode(
+        y=alt.Y("Tipo de registro:N", title=None, sort=list(CONTROL_RECORD_TYPES)),
+        x=alt.X(
+            "Importe:Q",
+            title="Importe",
+            axis=alt.Axis(format="$,.0s"),
+            scale=alt.Scale(domain=[0, amount_max * 1.35]),
+        ),
+        color=alt.Color(
+            "Tipo de registro:N",
+            title=None,
+            scale=alt.Scale(domain=list(CONTROL_RECORD_TYPES), range=palette),
+            legend=None,
+        ),
+    )
+    bars = base.mark_bar(cornerRadiusEnd=8, size=34).encode(
+        tooltip=[
+            alt.Tooltip("Tipo de registro:N", title="Registro"),
+            alt.Tooltip("Cantidad:Q", title="Cantidad", format=",.0f"),
+            alt.Tooltip("Importe:Q", title="Importe", format="$,.2f"),
+            alt.Tooltip("Participación importe:Q", title="Participación", format=".1%"),
+        ]
+    )
+    labels = base.mark_text(
+        align="left", baseline="middle", dx=8, color=foreground, fontSize=11, fontWeight=700
+    ).encode(text="Etiqueta:N")
+    chart = (bars + labels).properties(height=250).configure_view(stroke=None).configure_axis(
+        labelColor=foreground,
+        titleColor=foreground,
+        gridColor=grid,
+        domainColor=grid,
+        tickColor=grid,
+    )
+    st.altair_chart(chart, key="movement_type_chart")
+
+
 def movement_method_chart(data: pd.DataFrame) -> None:
-    st.subheader("Importe por medio de pago")
-    st.caption("Permite identificar qué medios concentran el volumen que debe controlarse.")
+    st.subheader("Composición por medio de pago")
+    st.caption("Muestra cuánto representan cheques, transferencias, efectivo, depósitos y los demás medios.")
     if data.empty:
         st.info("No hay movimientos para comparar.", icon=":material/account_balance:")
         return
@@ -877,7 +932,7 @@ with st.container(horizontal=True, vertical_alignment="center"):
     st.title("Control de cobranzas")
     st.badge("Información privada", icon=":material/shield_lock:", color="blue")
 st.caption(
-    "Cargá el CONRENPF una sola vez para analizar la cartera de cheques y conciliar los demás movimientos con sus recibos."
+    "Cargá el CONRENPF una sola vez para analizar la cartera de cheques y controlar todos los movimientos con sus recibos."
 )
 
 with st.sidebar:
@@ -906,7 +961,7 @@ if uploaded is None:
         st.subheader("Cargar el CONRENPF")
         st.write("Seleccioná el Excel desde el panel lateral para habilitar ambos módulos.")
         st.info(
-            "La cartera incluye CH24, CH48, CPD, ECHEQ y ECHEQDIF; el conciliador analiza los demás medios. El archivo se procesa en memoria y no se modifica.",
+            "La cartera incluye CH24, CH48, CPD, ECHEQ y ECHEQDIF; el control general integra esos cheques con los demás medios. El archivo se procesa en memoria y no se modifica.",
             icon=":material/info:",
         )
     st.stop()
@@ -931,20 +986,22 @@ module = st.segmented_control(
     default="Cartera de cheques",
     key="main_module",
 )
+control_cheques = int(movements["Tipo de registro"].eq("Cheque").sum()) if not movements.empty else 0
+control_bank_movements = int(movements["Tipo de registro"].eq("Movimiento bancario").sum()) if not movements.empty else 0
 st.caption(
-    f"El mismo CONRENPF alimenta ambos módulos: **{len(portfolio):,} cheques** y "
-    f"**{len(movements):,} movimientos no cheque** detectados.".replace(",", ".")
+    f"El mismo CONRENPF alimenta ambos módulos: **{control_cheques:,} cheques** y "
+    f"**{control_bank_movements:,} movimientos bancarios** detectados.".replace(",", ".")
 )
 
 if module == "Control de movimientos y recibos":
     st.header("Control de movimientos y recibos")
     st.caption(
-        "Analiza efectivo, transferencias, depósitos y otros medios de pago. "
-        "Un movimiento queda ‘A revisar’ cuando las fuentes informan recibos incompatibles."
+        "Integra la cartera de cheques con efectivo, transferencias, depósitos y otros movimientos bancarios. "
+        "Un registro queda ‘A revisar’ cuando las fuentes informan recibos incompatibles."
     )
     if movements.empty:
         st.info(
-            "Este CONRENPF no contiene movimientos no cheque. La cartera de cheques sigue disponible en el otro módulo.",
+            "Este CONRENPF no contiene registros utilizables para el control.",
             icon=":material/info:",
         )
         st.stop()
@@ -961,6 +1018,13 @@ if module == "Control de movimientos y recibos":
                 max_value=max_date,
                 format="DD/MM/YYYY",
                 key="movement_period",
+            )
+            movement_record_types = st.pills(
+                "Tipo de registro",
+                list(CONTROL_RECORD_TYPES),
+                default=list(CONTROL_RECORD_TYPES),
+                selection_mode="multi",
+                key="movement_record_types",
             )
             movement_clients = st.multiselect(
                 "Clientes",
@@ -999,6 +1063,10 @@ if module == "Control de movimientos y recibos":
         start_date, end_date = map(pd.Timestamp, selected_period)
         movement_dates = pd.to_datetime(movement_filtered["Fecha"], dayfirst=True, errors="coerce")
         movement_filtered = movement_filtered[movement_dates.between(start_date, end_date, inclusive="both")]
+    if movement_record_types:
+        movement_filtered = movement_filtered[movement_filtered["Tipo de registro"].isin(movement_record_types)]
+    else:
+        movement_filtered = movement_filtered.iloc[0:0]
     if movement_clients:
         movement_filtered = movement_filtered[movement_filtered["Cliente"].isin(movement_clients)]
     if movement_methods:
@@ -1009,7 +1077,9 @@ if module == "Control de movimientos y recibos":
         movement_filtered = movement_filtered.iloc[0:0]
     if movement_search.strip():
         needle = movement_search.strip().casefold()
-        searchable_columns = ["Cliente", "CUIT cliente", "Recibo relacionado", "N° operación", "Observación"]
+        searchable_columns = [
+            "Cliente", "CUIT cliente", "Recibo relacionado", "N° operación", "N° cheque / eCheq", "Observación"
+        ]
         searchable = (
             movement_filtered[searchable_columns]
             .fillna("")
@@ -1020,35 +1090,95 @@ if module == "Control de movimientos y recibos":
         movement_filtered = movement_filtered[searchable.str.contains(needle, regex=False)]
 
     movement_summary = movement_link_summary(movement_filtered).set_index("Estado vínculo")
+    type_summary = movement_type_summary(movement_filtered).set_index("Tipo de registro")
     total_movement_amount = float(pd.to_numeric(movement_filtered["Importe"], errors="coerce").fillna(0).sum())
+    cheque_count = int(type_summary.at["Cheque", "Cantidad"]) if "Cheque" in type_summary.index else 0
+    cheque_amount = float(type_summary.at["Cheque", "Importe"]) if "Cheque" in type_summary.index else 0.0
+    bank_count = int(type_summary.at["Movimiento bancario", "Cantidad"]) if "Movimiento bancario" in type_summary.index else 0
+    bank_amount = float(type_summary.at["Movimiento bancario", "Importe"]) if "Movimiento bancario" in type_summary.index else 0.0
+    gross_gap = bank_amount - cheque_amount
     with st.container(horizontal=True):
         st.metric(
-            f"Total · {len(movement_filtered):,} mov.".replace(",", "."),
+            f"Total controlado · {len(movement_filtered):,} reg.".replace(",", "."),
             format_currency(total_movement_amount),
             border=True,
         )
+        st.metric(f"Cheques · {cheque_count:,}".replace(",", "."), format_currency(cheque_amount), border=True)
+        st.metric(
+            f"Movimientos bancarios · {bank_count:,}".replace(",", "."),
+            format_currency(bank_amount),
+            border=True,
+        )
+        st.metric("Brecha bruta", format_currency(gross_gap), border=True)
+    st.caption(
+        "La brecha bruta es movimientos bancarios menos cheques dentro del período filtrado. "
+        "Sirve como señal de control y no confirma por sí sola una conciliación uno a uno."
+    )
+    with st.container(horizontal=True):
         for state in MOVEMENT_LINK_STATES:
             state_count = int(movement_summary.at[state, "Cantidad"]) if state in movement_summary.index else 0
             state_amount = float(movement_summary.at[state, "Importe"]) if state in movement_summary.index else 0.0
             st.metric(
-                f"{state} · {state_count:,} mov.".replace(",", "."),
+                f"{state} · {state_count:,} reg.".replace(",", "."),
                 format_currency(state_amount),
                 border=True,
             )
 
     left, right = st.columns(2)
     with left, st.container(border=True, height="stretch"):
-        movement_link_chart(movement_filtered)
+        movement_type_chart(movement_filtered)
     with right, st.container(border=True, height="stretch"):
+        movement_link_chart(movement_filtered)
+    with st.container(border=True):
         movement_method_chart(movement_filtered)
+
+    st.subheader("Cruce de cheques y movimientos por recibo")
+    st.caption(
+        "Agrupa los registros que tienen un recibo confiable. Un mismo recibo puede reunir más de un cheque o movimiento; "
+        "por eso los importes se comparan después de sumarlos."
+    )
+    reconciliation = receipt_reconciliation(movement_filtered)
+    non_comparable = int(movement_filtered["Estado vínculo"].ne("Con recibo").sum())
+    with st.container(horizontal=True):
+        for result_state in RECONCILIATION_STATES:
+            result_count = int(reconciliation["Resultado"].eq(result_state).sum()) if not reconciliation.empty else 0
+            receipt_word = "recibo" if result_count == 1 else "recibos"
+            st.metric(result_state, f"{result_count:,} {receipt_word}".replace(",", "."), border=True)
+        record_word = "registro" if non_comparable == 1 else "registros"
+        st.metric("Sin recibo confiable", f"{non_comparable:,} {record_word}".replace(",", "."), border=True)
+    if reconciliation.empty:
+        st.info(
+            "No hay recibos confiables en la selección actual para cruzar ambos grupos.",
+            icon=":material/link_off:",
+        )
+    else:
+        st.dataframe(
+            reconciliation,
+            hide_index=True,
+            height=min(430, 40 + 35 * len(reconciliation)),
+            key="receipt_reconciliation_table",
+            column_config={
+                "Recibo": st.column_config.TextColumn(pinned=True),
+                "Cheques": st.column_config.NumberColumn(format="%d"),
+                "Importe cheques": st.column_config.NumberColumn(format="$ %.2f"),
+                "Movimientos bancarios": st.column_config.NumberColumn(format="%d"),
+                "Importe movimientos bancarios": st.column_config.NumberColumn(format="$ %.2f"),
+                "Diferencia": st.column_config.NumberColumn(format="$ %.2f"),
+                "Resultado": st.column_config.TextColumn(pinned=True),
+            },
+        )
 
     st.subheader("Detalle de movimientos")
     st.caption(
-        f"Se muestran {len(movement_filtered):,} de {len(movements):,} movimientos no cheque. "
+        f"Se muestran {len(movement_filtered):,} de {len(movements):,} registros entre cheques y movimientos bancarios. "
         "La fila de origen permite volver al registro exacto del CONRENPF.".replace(",", ".")
     )
     movement_columns = [
+        "Tipo de registro",
         "Fecha",
+        "Fecha ingreso / pago",
+        "Fecha acreditación",
+        "Fecha vencimiento",
         "Cliente",
         "CUIT cliente",
         "Importe",
@@ -1056,6 +1186,8 @@ if module == "Control de movimientos y recibos":
         "Grupo medio de pago",
         "Banco / cuenta",
         "Subcuenta",
+        "Estado operativo",
+        "N° cheque / eCheq",
         "Estado vínculo",
         "Recibo relacionado",
         "Fuente del vínculo",
@@ -1069,7 +1201,11 @@ if module == "Control de movimientos y recibos":
         height=590,
         key="movement_detail_table",
         column_config={
+            "Tipo de registro": st.column_config.TextColumn(pinned=True),
             "Fecha": st.column_config.DateColumn(format="DD/MM/YYYY", pinned=True),
+            "Fecha ingreso / pago": st.column_config.DateColumn(format="DD/MM/YYYY"),
+            "Fecha acreditación": st.column_config.DateColumn(format="DD/MM/YYYY"),
+            "Fecha vencimiento": st.column_config.DateColumn(format="DD/MM/YYYY"),
             "Cliente": st.column_config.TextColumn(pinned=True),
             "Importe": st.column_config.NumberColumn(format="$ %.2f"),
             "Estado vínculo": st.column_config.TextColumn("Estado del recibo", pinned=True),
@@ -1080,7 +1216,7 @@ if module == "Control de movimientos y recibos":
     full_column, filtered_column = st.columns(2)
     with full_column, st.container(border=True, height="stretch"):
         st.markdown("### :material/table_view: Resultado completo")
-        st.write("Incluye todos los movimientos no cheque y sus filas fuente.")
+        st.write("Incluye todos los cheques, movimientos bancarios y sus filas fuente.")
         complete_movement_excel = make_movements_excel(movements, raw, cutoff)
         st.download_button(
             "Descargar Excel completo",
@@ -1093,7 +1229,7 @@ if module == "Control de movimientos y recibos":
         )
     with filtered_column, st.container(border=True, height="stretch"):
         st.markdown("### :material/filter_alt: Resultado filtrado")
-        st.write("Respeta el período, cliente, medio de pago, estado y búsqueda seleccionados.")
+        st.write("Respeta el período, tipo de registro, cliente, medio de pago, estado y búsqueda seleccionados.")
         filtered_movement_excel = make_movements_excel(movement_filtered, raw, cutoff)
         st.download_button(
             "Descargar Excel filtrado",
