@@ -6,6 +6,7 @@ import logging
 import re
 import unicodedata
 from datetime import date
+from decimal import Decimal
 
 import altair as alt
 import pandas as pd
@@ -273,18 +274,25 @@ def uploaded_cheques_overview(portfolio: pd.DataFrame) -> None:
     accredited = portfolio[states.eq("Acreditado")]
     linked = portfolio.get("Estado recibo", pd.Series(index=portfolio.index, dtype=object)).eq("Tomado")
 
-    def card(label: str, rows: pd.DataFrame, help_text: str, key: str) -> None:
-        amount = pd.to_numeric(rows.get("Importe", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()
+    def card(label: str, rows: pd.DataFrame, help_text: str, key: str, *, show_amount: bool = False) -> None:
+        amounts = pd.to_numeric(rows.get("Importe", pd.Series(dtype=float)), errors="coerce").fillna(0)
+        amount = sum((Decimal(str(value)) for value in amounts), Decimal("0"))
+        amount_text = "$ " + f"{amount:,.2f}".translate(str.maketrans(",.", ".,"))
+        count_text = f"{len(rows):,}".replace(",", ".")
+        count_unit = "cheque" if len(rows) == 1 else "cheques"
         with st.container(border=True, key=key):
-            st.metric(label, f"{len(rows):,}".replace(",", "."), help=help_text)
-            st.caption(f"Importe: **{format_currency(amount)}**")
+            st.metric(label, amount_text if show_amount else count_text, help=help_text)
+            if show_amount:
+                st.caption(f"Cantidad: **{count_text} {count_unit}**")
+            else:
+                st.caption(f"Importe: **{amount_text}**")
 
     st.subheader("Resumen del archivo")
     st.caption("Todos los cheques del archivo, consolidados sin duplicados. Este resumen no cambia con los filtros de abajo y no incluye otros movimientos bancarios.")
     with st.container(horizontal=True):
-        card("Total de cheques", portfolio, "Cantidad e importe de cheques únicos, en todos los estados.", "overview_total")
-        card("Pendientes de cobro", pending, "Todos los meses: pendientes, PS, vencidos y con vencimiento hoy. No incluye rechazados ni rescatados.", "overview_pending")
-        card("Acreditados", accredited, "Cheques que ya se consideran acreditados. AC prevalece sobre sus estados anteriores.", "overview_accredited")
+        card("Total de cheques", portfolio, "Importe total con centavos de los cheques únicos, en todos los estados. La cantidad se muestra debajo.", "overview_total", show_amount=True)
+        card("Pendientes de cobro", pending, "Importe pendiente de todos los meses: pendientes, PS, vencidos y con vencimiento hoy. No incluye rechazados ni rescatados.", "overview_pending", show_amount=True)
+        card("Acreditados", accredited, "Importe de los cheques acreditados. AC prevalece sobre sus estados anteriores.", "overview_accredited", show_amount=True)
 
     other_count = len(portfolio) - len(pending) - len(accredited)
     if other_count:
