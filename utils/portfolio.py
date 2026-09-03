@@ -11,6 +11,10 @@ import pandas as pd
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
+from utils.consolidation import cheque_number, consolidate_cheques, select_source_rows
+
+PROCESSING_VERSION = "consolidation-v10"
+
 ALLOWED_TYPES = ("CH24", "CH48", "CPD", "ECHEQ", "ECHEQDIF")
 BANK_FILTER_OPTIONS = ("Macro", "Galicia", "Nación")
 REJECTED_STATES = {"RC"}
@@ -69,20 +73,46 @@ def _system_state(value) -> tuple[str, str]:
     if not original:
         return "", ""
     patterns = {
-        "PS": r"(?<![A-Z])P[\s./_-]*S(?![A-Z])",
-        "RE": r"(?<![A-Z])R[\s./_-]*E(?![A-Z])",
-        "RC": r"(?<![A-Z])R[\s./_-]*C(?![A-Z])",
         "AC": r"(?<![A-Z])A[\s./_-]*C(?![A-Z])",
+        "RC": r"(?<![A-Z])R[\s./_-]*C(?![A-Z])",
+        "RE": r"(?<![A-Z])R[\s./_-]*E(?![A-Z])",
+        "PS": r"(?<![A-Z])P[\s./_-]*S(?![A-Z])",
     }
     for code, pattern in patterns.items():
         if re.search(pattern, original):
             return original, code
+    normalized = _normalized_text(original)
+    if "RECHAZAD" in normalized:
+        return original, "RC"
+    if "RESCATAD" in normalized:
+        return original, "RE"
+    if "PENDIENT" in normalized and "ACREDIT" in normalized:
+        return original, "PS"
+    if normalized in {"ACREDITADO", "ACREDITADA", "ACREDITADOS", "ACREDITADAS"}:
+        return original, "AC"
     return original, original
 
 
 def _normalized_text(value) -> str:
     text = unicodedata.normalize("NFKD", _clean(value))
     return "".join(character for character in text if not unicodedata.combining(character)).upper()
+
+
+def instrument_state(row: pd.Series) -> tuple[str, str]:
+    """Acepta el estado alternativo cuando el principal no trae un código operativo."""
+    candidates = [_system_state(row.get(column)) for column in ("MCR-Estado instr.", "Estado")]
+    for original, code in candidates:
+        if code in {"AC", "RC", "PS", "RE", "PE", "P"}:
+            return original, code
+    return next(((original, code) for original, code in candidates if original), ("", ""))
+
+
+def instrument_amount(row: pd.Series):
+    for column in ("MCR-Importe instr.", "Importe"):
+        value = row.get(column)
+        if value is not None and pd.notna(value) and str(value).strip():
+            return pd.to_numeric(value, errors="coerce")
+    return float("nan")
 
 
 def classify_cheque_status(
@@ -104,6 +134,8 @@ def classify_cheque_status(
     code = _normalized_text(rejection_code)
     reason = _normalized_text(rejection_reason)
 
+    if original_state == "AC":
+        return False, False, "Estado operativo AC"
     if original_state in RESCUED_STATES or "RESCATAD" in state_text:
         return False, True, "Estado RE / rescatado"
     if original_state in REJECTED_STATES:
@@ -232,7 +264,7 @@ def build_portfolio(raw: pd.DataFrame, cutoff: date | pd.Timestamp | None = None
             ("", "Sin vínculo detectado")
         )
 
-        original_state_text, original_state = _system_state(_first(row, "MCR-Estado instr.", "Estado"))
+        original_state_text, original_state = instrument_state(row)
         rejection_code = _clean(row.get("MCR-Código rechazo"))
         rejection_reason = _clean(row.get("MCR-Motivo rechazo"))
         entry_date = _date_value(_first(row, "MCR-Fecha pago", "Fecha Movimiento"))
@@ -253,12 +285,12 @@ def build_portfolio(raw: pd.DataFrame, cutoff: date | pd.Timestamp | None = None
             state = "Rescatado"
         elif rejected:
             state = "Rechazado"
+        elif original_state == "AC":
+            state = "Acreditado"
         elif original_state in PENDING_ACCREDITATION_STATES:
             state = "Pendiente de acreditación"
         elif not pd.isna(accreditation_date):
             state = "Acreditado" if accreditation_date <= cutoff_ts else "Pendiente de acreditación"
-        elif original_state == "AC":
-            state = "Acreditado"
         elif pd.isna(due_date):
             state = "Sin vencimiento"
         elif days_to_due < 0:
@@ -285,18 +317,19 @@ def build_portfolio(raw: pd.DataFrame, cutoff: date | pd.Timestamp | None = None
         if state == "Vencido": alerts.append("VENCIDO")
         elif state == "Vence hoy": alerts.append("VENCE HOY")
         elif state == "Pendiente" and days_to_due <= 7: alerts.append("VENCE ≤ 7 DÍAS")
-        amount = pd.to_numeric(_first(row, "MCR-Importe instr.", "Importe"), errors="coerce")
+        amount = instrument_amount(row)
 
         records.append({
             "ID cartera": f"CHQ-{number:04d}", "Fila fuente": int(row["Fila fuente"]),
             "Tipo": instrument_type, "Cliente": _clean(_first(row, "MCR-Nombre cliente", "Nombre")),
             "CUIT cliente": _identifier(row.get("MCR-CUIT cliente")),
             "N° cliente": _identifier(row.get("MCR-NRO. de cliente")),
-            "N° cheque / eCheq": _identifier(_first(row, "MCR-Número de cheque", "Nro de Cheque", "MCR-Nro instrumento")),
+            "N° cheque / eCheq": next((cheque_number(row.get(column)) for column in ("MCR-Número de cheque", "Nro de Cheque", "MCR-Nro instrumento", "N° cheque / eCheq") if cheque_number(row.get(column))), ""),
             "Banco cheque": _identifier(_first(row, "MCR-Banco", "Banco Del Cheque")),
             "Sucursal cheque": _identifier(_first(row, "MCR-Sucursal", "Suc Del Cheque")),
             "Cuenta cheque": _identifier(row.get("MCR-Cuenta de cheque")), "CUIT emisor": _identifier(row.get("MCR-CUIT emisor")),
             "Importe": float(amount) if not pd.isna(amount) else 0.0,
+            "Importe informado": bool(pd.notna(amount)),
             "Fecha ingreso / pago": entry_date, "Fecha acreditación": accreditation_date,
             "Fecha vencimiento": due_date, "Fecha prevista de cobro": expected_collection_date,
             "Días al cobro": days_to_collection, "Días al vencimiento": days_to_due, "Tramo vencimiento": bucket,
@@ -310,7 +343,7 @@ def build_portfolio(raw: pd.DataFrame, cutoff: date | pd.Timestamp | None = None
             "MCR-ID pago": _identifier(row.get("MCR-ID pago")), "MCR-ID instrumento": _identifier(row.get("MCR-ID instrumento")),
             "N° operación": _identifier(row.get("MCR-Número operación")),
         })
-    return pd.DataFrame.from_records(records)
+    return consolidate_cheques(pd.DataFrame.from_records(records))
 
 
 def portfolio_from_bytes(file_bytes: bytes, cutoff: date | None = None):
@@ -362,9 +395,10 @@ def _excel_safe(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def export_excel(portfolio: pd.DataFrame, raw: pd.DataFrame, cutoff: date) -> bytes:
-    source_rows = set(portfolio.get("Fila fuente", pd.Series(dtype=int)).dropna().astype(int))
-    scoped_raw = raw[raw["Fila fuente"].isin(source_rows)].copy() if "Fila fuente" in raw else raw.iloc[0:0]
-    scoped_raw = scoped_raw.drop(columns=["MCR-Número de recibo", "Nro Cpb Relacionado"], errors="ignore")
+    from utils.movements import build_movement_control, operational_export_tables
+
+    scoped_raw = select_source_rows(portfolio, raw)
+    movements = build_movement_control(scoped_raw, portfolio)
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         with_receipt = portfolio["Estado recibo"].eq("Tomado")
@@ -382,6 +416,7 @@ def export_excel(portfolio: pd.DataFrame, raw: pd.DataFrame, cutoff: date) -> by
                 "Cheques rescatados (RE)", "Importe rescatado (RE)",
                 "Cheques rechazados", "Importe rechazado",
                 "Cheques con recibo", "Importe con recibo", "Cheques sin recibo", "Importe sin recibo",
+                "Duplicados consolidados", "Rechazados luego acreditados",
             ],
             "Valor": [
                 pd.Timestamp(cutoff), len(portfolio), amounts.sum(), amounts[pending].sum(),
@@ -389,10 +424,14 @@ def export_excel(portfolio: pd.DataFrame, raw: pd.DataFrame, cutoff: date) -> by
                 amounts[states.eq("Rescatado")].sum(), int(states.eq("Rechazado").sum()),
                 amounts[states.eq("Rechazado")].sum(), int(with_receipt.sum()), amounts[with_receipt].sum(),
                 int((~with_receipt).sum()), amounts[~with_receipt].sum(),
+                int(portfolio.get("Duplicados consolidados", pd.Series(dtype=int)).sum()),
+                int(portfolio.get("Rechazado luego acreditado", pd.Series(dtype=bool)).sum()),
             ],
         })
         summary.to_excel(writer, sheet_name="Resumen", index=False)
         _excel_safe(portfolio).to_excel(writer, sheet_name="Cartera", index=False)
+        for sheet_name, table in operational_export_tables(movements, scoped_raw, cutoff).items():
+            _excel_safe(table).to_excel(writer, sheet_name=sheet_name, index=False)
         _excel_safe(scoped_raw).to_excel(writer, sheet_name="Datos fuente filtrados", index=False)
         for sheet_name in writer.book.sheetnames:
             ws = writer.book[sheet_name]; ws.freeze_panes = "A2"; ws.auto_filter.ref = ws.dimensions; ws.sheet_view.showGridLines = False
@@ -402,6 +441,13 @@ def export_excel(portfolio: pd.DataFrame, raw: pd.DataFrame, cutoff: date) -> by
             for cells in ws.columns:
                 letter = get_column_letter(cells[0].column); sample = [str(c.value or "") for c in list(cells)[:150]]
                 ws.column_dimensions[letter].width = min(max(max(map(len, sample), default=8) + 2, 11), 35)
+                header = str(cells[0].value or "")
+                if header.startswith("Fecha"):
+                    for cell in cells[1:]:
+                        cell.number_format = "dd/mm/yyyy"
+                elif header.startswith("Importe") and header != "Importe informado":
+                    for cell in cells[1:]:
+                        cell.number_format = '$#,##0.00;[Red]($#,##0.00);-'
         ws = writer.book["Cartera"]
         for cell in ws[get_column_letter(list(portfolio.columns).index("Importe") + 1)][1:]: cell.number_format = '$#,##0.00;[Red]($#,##0.00);-'
         for name in ("Fecha ingreso / pago", "Fecha acreditación", "Fecha vencimiento", "Fecha prevista de cobro"):

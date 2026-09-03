@@ -11,6 +11,12 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
+from utils import portfolio as portfolio_tools
+
+if getattr(portfolio_tools, "PROCESSING_VERSION", None) != "consolidation-v10":
+    portfolio_tools = importlib.reload(portfolio_tools)
+from utils.consolidation import SOURCE_ROWS, rejected_then_accredited
+
 from utils.analytics import (
     apply_operational_scope,
     collection_calendar_summary,
@@ -30,8 +36,10 @@ _MOVEMENT_API = (
     "movement_link_summary",
     "movement_type_summary",
     "receipt_reconciliation",
+    "pending_movements_detail",
+    "manual_accredited_movements",
 )
-if not all(hasattr(movement_tools, name) for name in _MOVEMENT_API):
+if getattr(movement_tools, "PROCESSING_VERSION", None) != "consolidation-v10" or not all(hasattr(movement_tools, name) for name in _MOVEMENT_API):
     movement_tools = importlib.reload(movement_tools)
 
 CONTROL_RECORD_TYPES = movement_tools.CONTROL_RECORD_TYPES
@@ -42,6 +50,8 @@ export_movements_excel = movement_tools.export_movements_excel
 movement_link_summary = movement_tools.movement_link_summary
 movement_type_summary = movement_tools.movement_type_summary
 receipt_reconciliation = movement_tools.receipt_reconciliation
+pending_movements_detail = movement_tools.pending_movements_detail
+manual_accredited_movements = movement_tools.manual_accredited_movements
 from utils.portfolio import (
     ALLOWED_TYPES,
     ConcentradorError,
@@ -62,7 +72,7 @@ from utils.security import (
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 LOGGER = logging.getLogger("cartera")
-PROCESSING_RULE_VERSION = "2026-09-02-unified-cheques-movements-v9"
+PROCESSING_RULE_VERSION = "2026-09-03-consolidation-ac-manu-v10"
 BANK_FILTER_OPTIONS = ("Macro", "Galicia", "Nación")
 MONTH_NAMES = ("enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre")
 
@@ -209,6 +219,48 @@ def make_movements_excel(movements: pd.DataFrame, raw: pd.DataFrame, cutoff: dat
 @st.cache_data(ttl="10m", max_entries=2, show_spinner="Generando el PDF profesional…", scope="session")
 def make_pdf(portfolio: pd.DataFrame, cutoff: date) -> bytes:
     return export_portfolio_pdf(portfolio, cutoff)
+
+
+def recovered_cheques_table(portfolio: pd.DataFrame, key: str) -> None:
+    st.subheader("Cheques rechazados que luego se acreditaron")
+    recovered = rejected_then_accredited(portfolio)
+    st.caption(
+        f"{len(recovered)} cheques con rechazo previo y AC final. Se cuentan una sola vez como acreditados; "
+        "el rechazo se conserva únicamente como historial. Fecha = acreditación o fecha de ingreso/pago de la fila AC."
+    )
+    if recovered.empty:
+        st.info("No hay casos RC → AC en esta selección.", icon=":material/fact_check:")
+    else:
+        st.dataframe(
+            recovered,
+            hide_index=True,
+            key=key,
+            column_config={
+                "Cliente": st.column_config.TextColumn(pinned=True),
+                "N° cheque": st.column_config.TextColumn(pinned=True),
+                "Importe": st.column_config.NumberColumn(format="$ %.2f"),
+                "Fecha": st.column_config.DateColumn(format="DD/MM/YYYY"),
+            },
+        )
+
+
+def pending_movements_table(movements: pd.DataFrame, key: str) -> None:
+    st.subheader("Movimientos pendientes")
+    pending = pending_movements_detail(movements)
+    st.caption(
+        f"{len(pending)} registros pendientes de cobro o acreditación. "
+        "Los AC consolidados y los MANU acreditados por fuera del concentrador no se incluyen."
+    )
+    st.dataframe(
+        pending,
+        hide_index=True,
+        key=key,
+        column_config={
+            "Cliente": st.column_config.TextColumn(pinned=True),
+            "Importe": st.column_config.NumberColumn(format="$ %.2f"),
+            "Fecha": st.column_config.DateColumn(format="DD/MM/YYYY"),
+        },
+    )
 
 
 def donut_chart(
@@ -966,7 +1018,7 @@ with st.sidebar:
             format="DD/MM/YYYY",
             help="La aplicación muestra la posición de la cartera a esta fecha y toma su mes como período principal de cobro.",
         )
-        st.caption("Un cheque se considera acreditado cuando su fecha de acreditación es igual o anterior a la fecha de análisis.")
+        st.caption("Si existe AC para el mismo N° de cheque e importe, el cheque queda acreditado. Sin AC, la fecha de análisis se usa para calcular vencimientos y cobros previstos.")
         if uploaded is not None and st.button("Descartar archivo", icon=":material/delete:", width="stretch"):
             st.cache_data.clear(); st.session_state.pop("source_file", None); st.rerun()
 
@@ -1006,6 +1058,17 @@ st.caption(
     f"El mismo CONRENPF alimenta ambos módulos: **{control_cheques:,} cheques** y "
     f"**{control_bank_movements:,} movimientos bancarios** detectados.".replace(",", ".")
 )
+duplicates_consolidated = int(portfolio.get("Duplicados consolidados", pd.Series(dtype=int)).sum())
+st.caption(
+    f"**{duplicates_consolidated:,} registros duplicados consolidados** por N° de cheque + importe. "
+    "AC prevalece sobre sus estados anteriores; las filas originales se conservan para auditoría.".replace(",", ".")
+)
+with st.expander("Auditoría de consolidación", icon=":material/history:"):
+    if portfolio.empty:
+        st.info("El archivo no contiene cheques.")
+    else:
+        audit_columns = ["Cliente", "N° cheque / eCheq", "Importe", "Estado final", "Cantidad registros origen", "Duplicados consolidados", "Historial de estados", SOURCE_ROWS]
+        st.dataframe(portfolio[audit_columns], hide_index=True, column_config={"Importe": st.column_config.NumberColumn(format="$ %.2f")})
 
 if module == "Control de movimientos y recibos":
     st.header("Control de movimientos y recibos")
@@ -1033,6 +1096,7 @@ if module == "Control de movimientos y recibos":
                 format="DD/MM/YYYY",
                 key="movement_period",
             )
+            include_undated = st.checkbox("Incluir registros sin fecha", value=True, key="movement_include_undated")
             movement_record_types = st.pills(
                 "Tipo de registro",
                 list(CONTROL_RECORD_TYPES),
@@ -1076,7 +1140,10 @@ if module == "Control de movimientos y recibos":
     if isinstance(selected_period, (tuple, list)) and len(selected_period) == 2:
         start_date, end_date = map(pd.Timestamp, selected_period)
         movement_dates = pd.to_datetime(movement_filtered["Fecha"], dayfirst=True, errors="coerce")
-        movement_filtered = movement_filtered[movement_dates.between(start_date, end_date, inclusive="both")]
+        date_mask = movement_dates.between(start_date, end_date, inclusive="both")
+        if include_undated:
+            date_mask = date_mask | movement_dates.isna()
+        movement_filtered = movement_filtered[date_mask]
     if movement_record_types:
         movement_filtered = movement_filtered[movement_filtered["Tipo de registro"].isin(movement_record_types)]
     else:
@@ -1137,6 +1204,20 @@ if module == "Control de movimientos y recibos":
                 format_currency(state_amount),
                 border=True,
             )
+
+    with st.container(border=True):
+        pending_movements_table(movement_filtered, "pending_movements_table")
+    manual_rows = manual_accredited_movements(movement_filtered)
+    with st.expander(f"MANU - acreditado fuera del concentrador · {len(manual_rows)} movimientos", expanded=False):
+        st.caption("MANU sin AC, RC o PS se considera acreditado por fuera del concentrador. No se inventa un recibo ni una fecha de acreditación.")
+        st.dataframe(
+            manual_rows.reindex(columns=["Cliente", "Medio de pago", "Fecha", "Importe", "Recibo relacionado", "Estado operativo", "Estado original", "Origen", SOURCE_ROWS]),
+            hide_index=True,
+            column_config={"Importe": st.column_config.NumberColumn(format="$ %.2f"), "Fecha": st.column_config.DateColumn(format="DD/MM/YYYY")},
+        )
+    with st.container(border=True):
+        selected_cheques = portfolio[portfolio["Fila fuente"].isin(movement_filtered["Fila fuente"])] if not portfolio.empty else portfolio
+        recovered_cheques_table(selected_cheques, "movement_recovered_cheques")
 
     left, right = st.columns(2)
     with left, st.container(border=True, height="stretch"):
@@ -1201,6 +1282,7 @@ if module == "Control de movimientos y recibos":
         "Banco / cuenta",
         "Subcuenta",
         "Estado operativo",
+        "Origen",
         "N° cheque / eCheq",
         "Estado vínculo",
         "Recibo relacionado",
@@ -1208,6 +1290,8 @@ if module == "Control de movimientos y recibos":
         "Fuentes detectadas",
         "Observación",
         "Fila fuente",
+        SOURCE_ROWS,
+        "Historial de estados",
     ]
     st.dataframe(
         movement_filtered[movement_columns].sort_values(["Fecha", "Importe"], ascending=[False, False]),
@@ -1398,7 +1482,7 @@ elif view == "Detalle de cheques":
     st.caption(
         f"Vista seleccionada: **{scope}** · mostrando {len(filtered):,} de {len(base_filtered):,} movimientos después de aplicar los filtros.".replace(",", ".")
     )
-    columns = ["Estado calculado", "Fecha prevista de cobro", "Días al cobro", "Cliente", "Importe", "Tipo", "N° cheque / eCheq", "Banco cheque", "Fecha acreditación", "Fecha vencimiento", "Código estado", "Fuente clasificación", "Estado recibo", "Recibo relacionado", "Fuente del vínculo", "Nro Cpb Relación", "Observaciones", "Código rechazo", "Motivo rechazo", "Alertas", "Fila fuente"]
+    columns = ["Estado calculado", "Fecha prevista de cobro", "Días al cobro", "Cliente", "Importe", "Tipo", "N° cheque / eCheq", "Banco cheque", "Fecha acreditación", "Fecha vencimiento", "Código estado", "Fuente clasificación", "Estado recibo", "Recibo relacionado", "Fuente del vínculo", "Nro Cpb Relación", "Observaciones", "Código rechazo", "Motivo rechazo", "Alertas", "Fila fuente", SOURCE_ROWS, "Historial de estados", "Duplicados consolidados"]
     st.dataframe(
         filtered[columns],
         hide_index=True,
@@ -1416,9 +1500,11 @@ elif view == "Detalle de cheques":
     )
 elif view == "Rescatados y rechazados":
     st.info(
-        "RE significa **rescatado** y nunca se suma a los rechazos. RC significa **rechazado**; cuando falta un estado explícito, la app solo clasifica como rechazo si coinciden código y motivo.",
+        "RE significa **rescatado**. RC significa **rechazado**. Si el mismo N° de cheque e importe tiene AC, solo cuenta como acreditado; el rechazo anterior queda en el cuadro de auditoría. Sin estado explícito, el rechazo exige código y motivo.",
         icon=":material/info:",
     )
+    with st.container(border=True):
+        recovered_cheques_table(base_filtered, "portfolio_recovered_cheques")
     with st.container(border=True):
         rescued_client_chart(base_filtered)
     with st.container(border=True):
@@ -1459,6 +1545,16 @@ elif view == "Control de recibos":
 else:
     st.subheader("Descargar reportes")
     st.caption("Generá documentos para compartir la posición completa o trabajar con la vista filtrada.")
+    with st.container(border=True):
+        st.markdown("### :material/fact_check: Excel completo de control y auditoría")
+        st.write("Cartera consolidada, movimientos pendientes, rechazados efectivos, rechazados luego acreditados, MANU acreditados y todas sus filas fuente. Sin filtros de pantalla.")
+        st.download_button(
+            "Descargar Excel completo de auditoría",
+            data=make_movements_excel(movements, raw, cutoff),
+            file_name=f"control_completo_auditoria_{cutoff:%Y-%m-%d}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            icon=":material/download:",
+        )
     pdf_column, excel_column = st.columns(2)
     with pdf_column, st.container(border=True, height="stretch"):
         st.markdown("### :material/picture_as_pdf: Posición completa en PDF")

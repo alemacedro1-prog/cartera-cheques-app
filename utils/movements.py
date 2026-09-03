@@ -11,16 +11,22 @@ from openpyxl.utils import get_column_letter
 
 from utils.portfolio import (
     ALLOWED_TYPES,
+    PENDING_COLLECTION_STATES,
     _clean,
     _date_value,
     _extract_observation_receipt,
     _first,
     _identifier,
     build_portfolio,
+    instrument_amount,
+    instrument_state,
 )
+from utils.consolidation import SOURCE_ROWS, cheque_number, rejected_then_accredited, select_source_rows
 
 
 MOVEMENT_LINK_STATES = ("Con recibo", "Sin recibo", "A revisar")
+PROCESSING_VERSION = "consolidation-v10"
+MANUAL_ORIGIN = "MANU - acreditado fuera del concentrador"
 CONTROL_RECORD_TYPES = ("Cheque", "Movimiento bancario")
 RECONCILIATION_STATES = (
     "Coincide recibo e importe",
@@ -148,8 +154,13 @@ def _cheque_control_records(raw: pd.DataFrame, portfolio: pd.DataFrame) -> list[
             {
                 "ID movimiento": _clean(cheque.get("ID cartera")),
                 "Fila fuente": source_row,
+                SOURCE_ROWS: cheque.get(SOURCE_ROWS, str(source_row)),
+                "Cantidad registros origen": int(cheque.get("Cantidad registros origen", 1)),
+                "Duplicados consolidados": int(cheque.get("Duplicados consolidados", 0)),
+                "Historial de estados": _clean(cheque.get("Historial de estados")),
+                "Rechazado luego acreditado": bool(cheque.get("Rechazado luego acreditado", False)),
                 "Tipo de registro": "Cheque",
-                "Fecha": _date_value(cheque.get("Fecha prevista de cobro")),
+                "Fecha": _date_value(cheque.get("Fecha prevista de cobro")) if pd.notna(cheque.get("Fecha prevista de cobro")) else _date_value(cheque.get("Fecha ingreso / pago")),
                 "Fecha ingreso / pago": _date_value(cheque.get("Fecha ingreso / pago")),
                 "Fecha acreditación": _date_value(cheque.get("Fecha acreditación")),
                 "Fecha vencimiento": _date_value(cheque.get("Fecha vencimiento")),
@@ -165,7 +176,11 @@ def _cheque_control_records(raw: pd.DataFrame, portfolio: pd.DataFrame) -> list[
                 "Fuente del vínculo": receipt_source,
                 "Fuentes detectadas": f"{receipt_source}: {receipt}" if receipt else "",
                 "Estado operativo": _clean(cheque.get("Estado calculado")),
-                "N° cheque / eCheq": _identifier(cheque.get("N° cheque / eCheq")),
+                "Estado original": _clean(cheque.get("Estado original")),
+                "Código estado": _clean(cheque.get("Código estado")),
+                "Origen": "CONRENPF - cheque consolidado",
+                "MANU acreditado fuera": False,
+                "N° cheque / eCheq": cheque_number(cheque.get("N° cheque / eCheq")),
                 "Nro Cpb Relación": _identifier(cheque.get("Nro Cpb Relación")),
                 "Nro Cpb Relacionado": _identifier(source.get("Nro Cpb Relacionado")),
                 "MCR-Número de recibo": _identifier(source.get("MCR-Número de recibo")),
@@ -194,7 +209,7 @@ def build_movement_control(raw: pd.DataFrame, portfolio: pd.DataFrame | None = N
         raw_method = _clean(row.get("MCR-Medio de pago")).upper()
         method_group = payment_method_group(raw_method)
         link = resolve_movement_receipt(row, method_group)
-        amount = pd.to_numeric(_first(row, "MCR-Importe instr.", "Importe"), errors="coerce")
+        amount = instrument_amount(row)
         movement_date = _date_value(
             _first(
                 row,
@@ -205,10 +220,27 @@ def build_movement_control(raw: pd.DataFrame, portfolio: pd.DataFrame | None = N
                 "Fecha Rendición",
             )
         )
+        original_state, state_code = instrument_state(row)
+        manual_external = raw_method == "MANU" and state_code not in {"AC", "RC", "PS"}
+        operational_state = {
+            "AC": "Acreditado",
+            "RC": "Rechazado",
+            "PS": "Pendiente de acreditación",
+            "RE": "Rescatado",
+            "PE": "Pendiente",
+            "P": "Pendiente",
+        }.get(state_code, "Sin estado informado")
+        if manual_external:
+            operational_state = "Acreditado"
         records.append(
             {
                 "ID movimiento": f"MOV-{number:04d}",
                 "Fila fuente": int(row["Fila fuente"]),
+                SOURCE_ROWS: str(int(row["Fila fuente"])),
+                "Cantidad registros origen": 1,
+                "Duplicados consolidados": 0,
+                "Historial de estados": f"Fila {int(row['Fila fuente'])}: {original_state or 'sin estado'}",
+                "Rechazado luego acreditado": False,
                 "Tipo de registro": "Movimiento bancario",
                 "Fecha": movement_date,
                 "Fecha ingreso / pago": movement_date,
@@ -225,8 +257,12 @@ def build_movement_control(raw: pd.DataFrame, portfolio: pd.DataFrame | None = N
                 "Recibo relacionado": link["Recibo relacionado"],
                 "Fuente del vínculo": link["Fuente del vínculo"],
                 "Fuentes detectadas": link["Fuentes detectadas"],
-                "Estado operativo": "",
-                "N° cheque / eCheq": "",
+                "Estado operativo": operational_state,
+                "Estado original": original_state,
+                "Código estado": state_code,
+                "Origen": MANUAL_ORIGIN if manual_external else "CONRENPF - movimiento bancario",
+                "MANU acreditado fuera": manual_external,
+                "N° cheque / eCheq": next((cheque_number(row.get(column)) for column in ("MCR-Número de cheque", "Nro de Cheque", "N° cheque / eCheq") if cheque_number(row.get(column))), ""),
                 "Nro Cpb Relación": _identifier(row.get("Nro Cpb Relación")),
                 "Nro Cpb Relacionado": _identifier(row.get("Nro Cpb Relacionado")),
                 "MCR-Número de recibo": _identifier(row.get("MCR-Número de recibo")),
@@ -239,6 +275,36 @@ def build_movement_control(raw: pd.DataFrame, portfolio: pd.DataFrame | None = N
     if not records:
         return pd.DataFrame()
     return pd.DataFrame.from_records(records).sort_values("Fila fuente").reset_index(drop=True)
+
+
+def pending_movements_detail(movements: pd.DataFrame) -> pd.DataFrame:
+    columns = ["Cliente", "Método de pago", "Fecha", "Importe", "N° cheque / eCheq", "Recibo relacionado", "Estado", "Origen", SOURCE_ROWS]
+    if movements.empty:
+        return pd.DataFrame(columns=columns)
+    pending = movements[movements["Estado operativo"].isin(PENDING_COLLECTION_STATES)].copy()
+    return pending.rename(columns={"Medio de pago": "Método de pago", "Estado operativo": "Estado"}).reindex(columns=columns).sort_values("Fecha", na_position="last").reset_index(drop=True)
+
+
+def manual_accredited_movements(movements: pd.DataFrame) -> pd.DataFrame:
+    mask = movements.get("MANU acreditado fuera", pd.Series(False, index=movements.index)).fillna(False).astype(bool)
+    return movements[mask].copy()
+
+
+def operational_export_tables(movements: pd.DataFrame, raw: pd.DataFrame, cutoff: date) -> dict[str, pd.DataFrame]:
+    """Mismas categorías y mismo alcance que la selección, con todo su historial."""
+    cheque_mask = movements.get("Tipo de registro", pd.Series(index=movements.index, dtype=object)).eq("Cheque")
+    cheque_raw = select_source_rows(movements[cheque_mask], raw)
+    portfolio = build_portfolio(cheque_raw, cutoff)
+    if portfolio.empty:
+        portfolio = pd.DataFrame(columns=["Cliente", "N° cheque / eCheq", "Importe", "Estado calculado", "Estado final", SOURCE_ROWS])
+    states = portfolio.get("Estado calculado", pd.Series(index=portfolio.index, dtype=object))
+    return {
+        "Cartera consolidada": portfolio,
+        "Movimientos pendientes": pending_movements_detail(movements),
+        "Rechazados efectivos": portfolio[states.eq("Rechazado")].copy(),
+        "Rechazados luego acreditados": rejected_then_accredited(portfolio),
+        "MANU acreditados": manual_accredited_movements(movements),
+    }
 
 
 def movement_link_summary(movements: pd.DataFrame) -> pd.DataFrame:
@@ -335,8 +401,8 @@ def _excel_safe(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def export_movements_excel(movements: pd.DataFrame, raw: pd.DataFrame, analysis_date: date) -> bytes:
-    source_rows = set(movements.get("Fila fuente", pd.Series(dtype=int)).dropna().astype(int))
-    scoped_raw = raw[raw["Fila fuente"].isin(source_rows)].copy() if "Fila fuente" in raw else raw.iloc[0:0]
+    scoped_raw = select_source_rows(movements, raw)
+    operational_tables = operational_export_tables(movements, scoped_raw, analysis_date)
     amounts = pd.to_numeric(movements.get("Importe", pd.Series(dtype=float)), errors="coerce").fillna(0)
     states = movements.get("Estado vínculo", pd.Series(index=movements.index, dtype=object))
     reconciliation = receipt_reconciliation(movements)
@@ -344,6 +410,11 @@ def export_movements_excel(movements: pd.DataFrame, raw: pd.DataFrame, analysis_
         ("Fecha de análisis", pd.Timestamp(analysis_date)),
         ("Registros controlados", len(movements)),
         ("Importe total", amounts.sum()),
+        ("Duplicados de cheques consolidados", int(movements.get("Duplicados consolidados", pd.Series(dtype=int)).sum())),
+        ("Movimientos pendientes", len(operational_tables["Movimientos pendientes"])),
+        ("Rechazados efectivos", len(operational_tables["Rechazados efectivos"])),
+        ("Rechazados luego acreditados", len(operational_tables["Rechazados luego acreditados"])),
+        ("MANU acreditados fuera del concentrador", len(operational_tables["MANU acreditados"])),
     ]
     record_types = movements.get("Tipo de registro", pd.Series(index=movements.index, dtype=object))
     for record_type in CONTROL_RECORD_TYPES:
@@ -371,6 +442,8 @@ def export_movements_excel(movements: pd.DataFrame, raw: pd.DataFrame, analysis_
         summary.to_excel(writer, sheet_name="Resumen", index=False)
         _excel_safe(movements).to_excel(writer, sheet_name="Movimientos", index=False)
         _excel_safe(reconciliation).to_excel(writer, sheet_name="Cruce por recibo", index=False)
+        for sheet_name, table in operational_tables.items():
+            _excel_safe(table).to_excel(writer, sheet_name=sheet_name, index=False)
         _excel_safe(scoped_raw).to_excel(writer, sheet_name="Datos fuente filtrados", index=False)
         for sheet_name in writer.book.sheetnames:
             ws = writer.book[sheet_name]
@@ -385,12 +458,19 @@ def export_movements_excel(movements: pd.DataFrame, raw: pd.DataFrame, analysis_
                 letter = get_column_letter(cells[0].column)
                 sample = [str(cell.value or "") for cell in list(cells)[:150]]
                 ws.column_dimensions[letter].width = min(max(max(map(len, sample), default=8) + 2, 11), 38)
+                header = str(cells[0].value or "")
+                if header.startswith("Fecha"):
+                    for cell in cells[1:]:
+                        cell.number_format = "dd/mm/yyyy"
+                elif header.startswith("Importe") and header != "Importe informado":
+                    for cell in cells[1:]:
+                        cell.number_format = '$#,##0.00;[Red]($#,##0.00);-'
         summary_ws = writer.book["Resumen"]
         for row_number, indicator in enumerate(summary["Indicador"], start=2):
             value_cell = summary_ws.cell(row=row_number, column=2)
             if indicator == "Fecha de análisis":
                 value_cell.number_format = "dd/mm/yyyy"
-            elif "importe" in indicator.casefold():
+            elif indicator == "Importe total" or indicator.endswith(" - importe"):
                 value_cell.number_format = '$#,##0.00;[Red]($#,##0.00);-'
             else:
                 value_cell.number_format = "#,##0"

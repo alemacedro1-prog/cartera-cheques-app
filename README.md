@@ -2,6 +2,21 @@
 
 Aplicación privada en Streamlit que carga un único CONRENPF y ofrece dos módulos: `Cartera de cheques` y `Control de movimientos y recibos`.
 
+## Consolidación y auditoría
+
+- La clave de un cheque es **N° de cheque/eCheq + importe a centavos**. El número conserva sus ceros iniciales; se normalizan espacios externos, mayúsculas y el sufijo numérico `.0` de Excel.
+- Sin número o sin importe válido, la fila se mantiene individual: nunca se agrupa solo por importe.
+- Si existe un registro AC dentro de esa clave, el cheque se cuenta una sola vez como **Acreditado**, aun si la fecha de análisis es anterior. RC/PS quedan únicamente como historial. Entre varios AC se utiliza el de fecha de acreditación/ingreso más reciente.
+- Sin AC, se usa el registro más reciente por fecha de ingreso/pago y, a igualdad o falta de fecha, por fila original. El vencimiento no se interpreta como fecha de cambio de estado.
+- Cada instrumento incluye cantidad de filas, duplicados consolidados, historial de estados y todas las filas originales del CONRENPF. Los datos fuente nunca se eliminan por consolidar.
+- El cuadro **Cheques rechazados que luego se acreditaron** muestra cliente, número, importe, estados anterior/final, fecha del AC, motivo histórico y filas originales. No suma esos importes a los rechazos efectivos.
+- Un movimiento **MANU** sin AC, RC o PS se marca **Acreditado** y con origen **MANU - acreditado fuera del concentrador**. Si tiene AC/RC/PS, respeta ese estado. No se inventan recibos ni fechas.
+- **Movimientos pendientes** separa cliente, método, fecha, importe, número de cheque, recibo, estado y origen; excluye AC y MANU acreditados.
+
+El Excel completo incorpora `Cartera consolidada`, `Movimientos pendientes`, `Rechazados efectivos`, `Rechazados luego acreditados`, `MANU acreditados` y `Datos fuente filtrados`, además del resumen y cruce de recibos. Las descargas filtradas conservan todas las filas históricas de los registros seleccionados y no incluyen registros ajenos. La pestaña `Cartera` del Excel filtrado se mantiene por compatibilidad.
+
+Los totales indicados para CONRENPF(4) —1.716 únicos, 42 duplicados, 2 RC→AC, 29 rechazados, 475 pendientes y 166 MANU— son referencias aportadas por el usuario. Falta verificarlos con ese archivo, que no estaba disponible durante esta implementación; no se usan como cifras fijas en la aplicación.
+
 En la cartera de cheques, el recibo relacionado se obtiene exclusivamente de `Observación` y `Nro Cpb Relación`. Un número con formato de recibo dentro de la observación, por ejemplo `819-591309`, tiene prioridad y queda marcado como `Tomado`. También se reconoce como recibo interno de cobranza cualquier secuencia numérica de tres o más dígitos que comience con `75`, sin límite máximo de longitud; por ejemplo `756699` o `756701`. Si no aparece ninguno, se usa el comprobante de relación. `MCR-Número de recibo` no participa en el vínculo de cheques. El archivo original nunca se modifica.
 
 El módulo de movimientos integra CH24, CH48, CPD, ECHEQ y ECHEQDIF con efectivo, transferencias, depósitos y cualquier otro medio informado. Cada fila queda identificada como `Cheque` o `Movimiento bancario`, permitiendo filtrar, comparar importes y revisar los vínculos con recibos en un único control. La brecha entre ambos grupos es orientativa y no se presenta como una conciliación automática uno a uno.

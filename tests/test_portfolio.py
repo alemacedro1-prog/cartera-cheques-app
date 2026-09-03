@@ -148,13 +148,13 @@ def test_rejection_metadata_does_not_override_accredited_state():
     assert build_portfolio(frame, date(2026, 8, 18)).iloc[0]["Estado calculado"] == "Acreditado"
 
 
-def test_accreditation_date_after_cutoff_is_still_pending():
+def test_explicit_ac_is_final_even_when_date_is_after_cutoff():
     frame = pd.DataFrame([row(**{"MCR-Estado instr.": "AC", "MCR-Fecha acredit.": "21/08/2026"})])
 
     result = build_portfolio(frame, date(2026, 8, 18)).iloc[0]
 
-    assert result["Estado calculado"] == "Pendiente de acreditación"
-    assert "PENDIENTE DE ACREDITACIÓN" in result["Alertas"]
+    assert result["Estado calculado"] == "Acreditado"
+    assert "PENDIENTE DE ACREDITACIÓN" not in result["Alertas"]
 
 
 def test_moving_cutoff_to_accreditation_date_marks_cheque_accredited():
@@ -348,8 +348,8 @@ def test_export_is_filtered_and_neutralizes_formulas():
     assert indicators["Cheques sin recibo"] == 0
     assert indicators["Importe con recibo"] == 1000
     assert "MCR-Número de recibo" not in cartera.columns
-    assert "MCR-Número de recibo" not in source.columns
-    assert "Nro Cpb Relacionado" not in source.columns
+    assert "MCR-Número de recibo" in source.columns
+    assert "Nro Cpb Relacionado" in source.columns
     assert len(source) == 1
     assert source.iloc[0]["Observación"].startswith("'")
 
