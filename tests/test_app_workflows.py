@@ -42,6 +42,11 @@ def test_consolidated_workflows_render_without_errors(monkeypatch, module, secti
     app.run()
     assert not app.exception, [item.message for item in app.exception]
     assert expected_heading in [item.value for item in app.subheader]
+    assert [item.label for item in app.metric[:5]] == [
+        "Total de cheques", "Pendientes de cobro", "Acreditados", "Sin recibo asociado", "Con recibo asociado",
+    ]
+    assert [item.value for item in app.metric[:5]] == ["2", "1", "1", "2", "0"]
+    assert app.subheader[0].value == "Resumen del archivo"
     if module == "Control de movimientos y recibos":
         pending_table = next(table.value for table in app.dataframe if "Método de pago" in table.value.columns)
         assert len(pending_table) == 1
@@ -93,6 +98,8 @@ def test_rejected_bank_chart_and_filter_use_deposit_not_issuer(monkeypatch, sele
     assert "Cheques rechazados por banco de depósito" in [item.value for item in app.subheader]
     metrics = {item.label: item.value for item in app.metric}
     assert metrics["Macro · 1 rechazados"] == "$ 300"
+    # El filtro Macro afecta el gráfico, pero no el resumen completo del archivo.
+    assert [item.value for item in app.metric[:5]] == ["5", "0", "0", "5", "0"]
     summary = next(table.value for table in app.dataframe if "Importe rechazado" in table.value.columns and "Banco" in table.value.columns)
     assert summary["Importe rechazado"].sum() == (300 if selected_banks else 2500)
     assert summary["Cantidad de rechazados"].sum() == (1 if selected_banks else 5)
@@ -104,3 +111,40 @@ def test_rejected_bank_chart_and_filter_use_deposit_not_issuer(monkeypatch, sele
     chart_rows = next(iter(spec["datasets"].values()))
     assert [item["Banco"] for item in chart_rows] == ["Macro", "Galicia", "Nación"]
     assert spec["layer"][0]["encoding"]["x"]["axis"]["tickCount"] == 5
+
+
+@pytest.mark.parametrize("manual_only", [False, True])
+def test_upload_overview_receipts_and_amounts_cover_all_cheque_states(monkeypatch, manual_only):
+    rows = [{"MCR-Medio de pago": "MANU", "MCR-Estado instr.": "", "MCR-Importe instr.": 9999}]
+    if not manual_only:
+        rows.extend([
+            {"MCR-Medio de pago": "CPD", "MCR-Estado instr.": state, "MCR-Número de cheque": number,
+             "MCR-Importe instr.": amount, "Observación": receipt, "MCR-Fecha vencim.": "10/09/2026"}
+            for state, number, amount, receipt in [
+                ("RC", "1", 100, "756699"), ("AC", "1", 100, ""),
+                ("PS", "2", 200, "819-591309"), ("RC", "3", 300, ""), ("RE", "4", 400, ""),
+            ]
+        ])
+    upload = BytesIO()
+    pd.DataFrame(rows).to_excel(upload, index=False)
+    upload.name = "CONRENPF_resumen_sintetico.xlsx"
+    monkeypatch.setattr(st, "file_uploader", lambda *args, **kwargs: upload)
+    app = AppTest.from_file(str(Path(__file__).parents[1] / "streamlit_app.py"), default_timeout=45)
+    app.secrets["app"] = {"require_auth": False}
+    app.run()
+    assert not app.exception, [item.message for item in app.exception]
+    assert [item.value for item in app.metric[:5]] == (["0"] * 5 if manual_only else ["4", "1", "1", "2", "2"])
+    amounts = [item.value for item in app.caption if item.value.startswith("Importe: **")][:5]
+    assert amounts == (["Importe: **$ 0**"] * 5 if manual_only else [
+        "Importe: **$ 1.000**", "Importe: **$ 200**", "Importe: **$ 100**", "Importe: **$ 700**", "Importe: **$ 300**",
+    ])
+
+
+def test_upload_overview_is_not_shown_before_file_is_loaded(monkeypatch):
+    monkeypatch.setattr(st, "file_uploader", lambda *args, **kwargs: None)
+    app = AppTest.from_file(str(Path(__file__).parents[1] / "streamlit_app.py"), default_timeout=45)
+    app.secrets["app"] = {"require_auth": False}
+    app.run()
+    assert not app.exception
+    assert "Resumen del archivo" not in [item.value for item in app.subheader]
+    assert not app.metric

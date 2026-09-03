@@ -61,6 +61,10 @@ py -m venv .venv
 
 Sin `.streamlit/secrets.toml`, la app muestra una advertencia y funciona solo como entorno local. No exponga ese modo a internet.
 
+## Resumen inicial del archivo
+
+Al cargar el archivo se muestra primero un resumen de cheques únicos: total, pendientes de cobro (todos los meses) y acreditados; debajo, sin recibo y con recibo. Cada tarjeta incluye cantidad e importe. El resumen usa la cartera consolidada completa, no los filtros de pantalla ni los movimientos bancarios MANU/transferencias. Los recibos se cuentan en todos los estados, incluidos los acreditados.
+
 ## Rechazos por banco de depósito
 
 - El gráfico y el filtro bancario de cartera usan `Banco depósito` (`Nombre del banco` o `MCR-Banco depósito` en el CONRENPF), no el banco emisor del cheque.

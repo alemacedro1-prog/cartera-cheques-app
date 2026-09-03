@@ -231,6 +231,38 @@ def make_pdf(portfolio: pd.DataFrame, cutoff: date) -> bytes:
     return export_portfolio_pdf(portfolio, cutoff)
 
 
+def uploaded_cheques_overview(portfolio: pd.DataFrame) -> None:
+    """Resumen completo del archivo, antes de los módulos y sus filtros."""
+    states = portfolio.get("Estado calculado", pd.Series(index=portfolio.index, dtype=object))
+    pending = pending_collection(portfolio)
+    accredited = portfolio[states.eq("Acreditado")]
+    linked = portfolio.get("Estado recibo", pd.Series(index=portfolio.index, dtype=object)).eq("Tomado")
+
+    def card(label: str, rows: pd.DataFrame, help_text: str, key: str) -> None:
+        amount = pd.to_numeric(rows.get("Importe", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()
+        with st.container(border=True, key=key):
+            st.metric(label, f"{len(rows):,}".replace(",", "."), help=help_text)
+            st.caption(f"Importe: **{format_currency(amount)}**")
+
+    st.subheader("Resumen del archivo")
+    st.caption("Todos los cheques del archivo, consolidados sin duplicados. Este resumen no cambia con los filtros de abajo y no incluye otros movimientos bancarios.")
+    with st.container(horizontal=True):
+        card("Total de cheques", portfolio, "Cantidad e importe de cheques únicos, en todos los estados.", "overview_total")
+        card("Pendientes de cobro", pending, "Todos los meses: pendientes, PS, vencidos y con vencimiento hoy. No incluye rechazados ni rescatados.", "overview_pending")
+        card("Acreditados", accredited, "Cheques que ya se consideran acreditados. AC prevalece sobre sus estados anteriores.", "overview_accredited")
+
+    other_count = len(portfolio) - len(pending) - len(accredited)
+    if other_count:
+        other_label = f"{other_count:,}".replace(",", ".")
+        st.caption(f"El total también incluye {other_label} cheques en otros estados: rechazados, rescatados o sin vencimiento informado. No se suman a pendientes ni a acreditados.")
+
+    st.markdown("#### Recibos asociados")
+    st.caption("Control sobre el total de cheques, estén acreditados o todavía no. Con recibo + sin recibo = total de cheques.")
+    with st.container(horizontal=True):
+        card("Sin recibo asociado", portfolio[~linked], "No se detectó recibo en Observación ni en Nro Cpb Relación.", "overview_without_receipt")
+        card("Con recibo asociado", portfolio[linked], "Recibo identificado en Observación o Nro Cpb Relación, incluidos los números internos que empiezan con 75.", "overview_with_receipt")
+
+
 def recovered_cheques_table(portfolio: pd.DataFrame, key: str) -> None:
     st.subheader("Cheques rechazados que luego se acreditaron")
     recovered = rejected_then_accredited(portfolio)
@@ -1069,6 +1101,8 @@ except Exception:
     st.error("No pude procesar el archivo. Confirmá que sea un CONRENPF válido y no protegido.", icon=":material/error:"); st.stop()
 finally:
     del file_bytes
+
+uploaded_cheques_overview(portfolio)
 
 module = st.segmented_control(
     "Módulo",
