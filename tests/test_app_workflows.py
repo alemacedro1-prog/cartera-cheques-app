@@ -46,3 +46,61 @@ def test_consolidated_workflows_render_without_errors(monkeypatch, module, secti
         pending_table = next(table.value for table in app.dataframe if "Método de pago" in table.value.columns)
         assert len(pending_table) == 1
         assert pending_table.iloc[0]["N° cheque / eCheq"] == "1002"
+
+
+@pytest.mark.parametrize("selected_banks", [[], ["Macro"]])
+def test_rejected_bank_chart_and_filter_use_deposit_not_issuer(monkeypatch, selected_banks):
+    rows = pd.DataFrame([
+        {"MCR-Medio de pago": "CPD", "MCR-Estado instr.": "RC", "MCR-Número de cheque": str(index),
+         "MCR-Importe instr.": amount, "MCR-Banco": issuer, "Nombre del banco": deposit,
+         "MCR-Nombre cliente": "Cliente de prueba", "MCR-Fecha pago": "01/09/2026"}
+        for index, (issuer, deposit, amount) in enumerate([
+            ("ICBC", "Macro", 300), ("CREDICOOP", "Galicia", 400), ("SANTA FE", "Nación", 600),
+            ("Macro", "", 500), ("Galicia", "ICBC", 700),
+        ], start=100)
+    ])
+    upload = BytesIO()
+    rows.to_excel(upload, index=False)
+    upload.name = "CONRENPF_bancos_sintetico.xlsx"
+    monkeypatch.setattr(st, "file_uploader", lambda *args, **kwargs: upload)
+    original_segmented, original_pills, original_chart = st.segmented_control, st.pills, st.altair_chart
+    chart_specs = []
+
+    def choose(label, *args, **kwargs):
+        if label == "Módulo":
+            return "Cartera de cheques"
+        if label == "Sección":
+            return "Rescatados y rechazados"
+        return original_segmented(label, *args, **kwargs)
+
+    def filter_bank(label, *args, **kwargs):
+        if label == "Banco de depósito":
+            return selected_banks
+        return original_pills(label, *args, **kwargs)
+
+    def capture_chart(chart, *args, **kwargs):
+        if kwargs.get("key") == "chart_rejected_banks":
+            chart_specs.append(chart.to_dict())
+        return original_chart(chart, *args, **kwargs)
+
+    monkeypatch.setattr(st, "segmented_control", choose)
+    monkeypatch.setattr(st, "pills", filter_bank)
+    monkeypatch.setattr(st, "altair_chart", capture_chart)
+    app = AppTest.from_file(str(Path(__file__).parents[1] / "streamlit_app.py"), default_timeout=45)
+    app.secrets["app"] = {"require_auth": False}
+    app.run()
+    assert not app.exception, [item.message for item in app.exception]
+    assert "Cheques rechazados por banco de depósito" in [item.value for item in app.subheader]
+    metrics = {item.label: item.value for item in app.metric}
+    assert metrics["Macro · 1 rechazados"] == "$ 300"
+    summary = next(table.value for table in app.dataframe if "Importe rechazado" in table.value.columns and "Banco" in table.value.columns)
+    assert summary["Importe rechazado"].sum() == (300 if selected_banks else 2500)
+    assert summary["Cantidad de rechazados"].sum() == (1 if selected_banks else 5)
+    if not selected_banks:
+        exceptions = next(table.value for table in app.dataframe if "Banco de depósito agrupado" in table.value.columns)
+        assert set(exceptions["Banco de depósito agrupado"]) == {"Sin banco de depósito", "Otros bancos de depósito"}
+        assert exceptions["Importe"].sum() == 1200
+    spec = chart_specs[-1]
+    chart_rows = next(iter(spec["datasets"].values()))
+    assert [item["Banco"] for item in chart_rows] == ["Macro", "Galicia", "Nación"]
+    assert spec["layer"][0]["encoding"]["x"]["axis"]["tickCount"] == 5

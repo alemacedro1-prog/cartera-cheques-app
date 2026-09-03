@@ -61,6 +61,13 @@ py -m venv .venv
 
 Sin `.streamlit/secrets.toml`, la app muestra una advertencia y funciona solo como entorno local. No exponga ese modo a internet.
 
+## Rechazos por banco de depósito
+
+- El gráfico y el filtro bancario de cartera usan `Banco depósito` (`Nombre del banco` o `MCR-Banco depósito` en el CONRENPF), no el banco emisor del cheque.
+- La comparación principal muestra Macro, Galicia y Nación. Un cheque emitido por ICBC, Credicoop o Santa Fe y depositado en Macro se cuenta en Macro.
+- Los depósitos en otros bancos y los registros sin dato se conservan en el total, las estadísticas y un detalle de revisión separado; nunca se asignan usando el banco emisor como sustituto.
+- El PDF usa la misma agrupación. Los Excel conservan tanto banco de depósito como banco emisor y la trazabilidad original.
+
 ## Pruebas
 
 ```powershell

@@ -17,12 +17,18 @@ if getattr(portfolio_tools, "PROCESSING_VERSION", None) != "consolidation-v10":
     portfolio_tools = importlib.reload(portfolio_tools)
 from utils.consolidation import SOURCE_ROWS, rejected_then_accredited
 
+from utils import analytics as analytics_tools
+
+if getattr(analytics_tools, "PROCESSING_VERSION", None) != "deposit-banks-v11":
+    analytics_tools = importlib.reload(analytics_tools)
 from utils.analytics import (
     apply_operational_scope,
     collection_calendar_summary,
     pending_collection,
     pending_for_month,
     receipt_summary,
+    deposit_bank_group,
+    rejected_bank_detail,
     rejected_bank_summary,
 )
 from utils import movements as movement_tools
@@ -60,7 +66,11 @@ from utils.portfolio import (
     portfolio_from_bytes,
     rejected_monthly_summary,
 )
-from utils.reports import export_portfolio_pdf
+from utils import reports as report_tools
+
+if getattr(report_tools, "PROCESSING_VERSION", None) != "deposit-banks-v11":
+    report_tools = importlib.reload(report_tools)
+export_portfolio_pdf = report_tools.export_portfolio_pdf
 from utils.security import (
     email_is_allowed,
     normalize_username,
@@ -72,7 +82,7 @@ from utils.security import (
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 LOGGER = logging.getLogger("cartera")
-PROCESSING_RULE_VERSION = "2026-09-03-consolidation-ac-manu-v10"
+PROCESSING_RULE_VERSION = "2026-09-03-deposit-banks-v11"
 BANK_FILTER_OPTIONS = ("Macro", "Galicia", "Nación")
 MONTH_NAMES = ("enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre")
 
@@ -603,19 +613,21 @@ def rescued_client_chart(data: pd.DataFrame) -> None:
 
 def rejected_bank_chart(data: pd.DataFrame) -> None:
     summary = rejected_bank_summary(data)
-    st.subheader("Cheques rechazados por banco girado")
+    st.subheader("Cheques rechazados por banco de depósito")
     st.caption(
-        "RC identifica un rechazo. Si el estado viene vacío, la app exige código y motivo compatibles; RE siempre permanece como rescatado."
+        "Compara dónde se depositaron los cheques: Macro, Galicia y Nación. "
+        "El banco emisor (ICBC, Credicoop, Santa Fe u otro) no determina esta agrupación. "
+        "Solo incluye rechazos efectivos; RE y los RC que luego tienen AC quedan fuera."
     )
     if summary.empty:
         st.info("No hay cheques rechazados en la vista actual.", icon=":material/account_balance:")
         return
 
     indexed = summary.set_index("Banco")
-    rejected_rows = data[data["Estado calculado"].eq("Rechazado")]
+    rejected_rows = rejected_bank_detail(data)
     with st.container(horizontal=True):
         st.metric(
-            f"Total · {len(rejected_rows)} rechazados",
+            f"Total de la selección · {len(rejected_rows)} rechazados",
             format_currency(rejected_rows["Importe"].sum()),
             border=True,
         )
@@ -624,20 +636,31 @@ def rejected_bank_chart(data: pd.DataFrame) -> None:
             count = int(indexed.at[bank, "Cantidad de rechazados"]) if bank in indexed.index else 0
             st.metric(f"{bank} · {count} rechazados", format_currency(amount), border=True)
 
-    other_count = int(indexed.at["Otros bancos", "Cantidad de rechazados"]) if "Otros bancos" in indexed.index else 0
-    other_amount = float(indexed.at["Otros bancos", "Importe rechazado"]) if "Otros bancos" in indexed.index else 0.0
-    if other_count:
-        st.caption(
-            f"Además hay **{other_count} rechazados** por **{format_currency(other_amount)}** de otros bancos; "
-            "se conservan para que el total general no pierda movimientos."
+    exceptions = rejected_rows[~rejected_rows["Banco de depósito agrupado"].isin(BANK_FILTER_OPTIONS)]
+    if not exceptions.empty:
+        st.warning(
+            f"{len(exceptions)} rechazados por {format_currency(exceptions['Importe'].sum())} quedan fuera de la comparación "
+            "de los tres bancos: tienen otro banco de depósito o ese dato no está informado. "
+            "Sí están incluidos en el total de la selección.",
+            icon=":material/info:",
         )
+        with st.expander("Revisar banco de depósito de estos cheques", icon=":material/fact_check:"):
+            st.caption("Se conserva el dato del CONRENPF. No se usa el banco emisor para completar un depósito faltante.")
+            st.dataframe(
+                exceptions.reindex(columns=["Cliente", "N° cheque / eCheq", "Importe", "Banco depósito", "Banco cheque", "Banco de depósito agrupado", SOURCE_ROWS]),
+                hide_index=True,
+                column_config={
+                    "Importe": st.column_config.NumberColumn(format="$ %.2f"),
+                    "Banco cheque": st.column_config.TextColumn("Banco emisor del cheque"),
+                },
+            )
 
     dark_theme = st.context.theme.type == "dark"
     foreground = "#E7EEF8" if dark_theme else "#23364A"
     grid = "#2A3B53" if dark_theme else "#DCE5EE"
-    display_order = [*BANK_FILTER_OPTIONS, "Otros bancos"]
-    palette = ["#67B7F7", "#B99AF5", "#F8C65A", "#9AA9BC"] if dark_theme else ["#245A8D", "#7957B8", "#C48717", "#65758B"]
-    chart_data = summary.copy()
+    display_order = list(BANK_FILTER_OPTIONS)
+    palette = ["#67B7F7", "#B99AF5", "#F8C65A"] if dark_theme else ["#245A8D", "#7957B8", "#C48717"]
+    chart_data = summary[summary["Banco"].isin(BANK_FILTER_OPTIONS)].copy()
     chart_data["Etiqueta"] = chart_data.apply(
         lambda row: f"{format_currency(row['Importe rechazado'])} · {int(row['Cantidad de rechazados'])} chq.", axis=1
     )
@@ -647,7 +670,7 @@ def rejected_bank_chart(data: pd.DataFrame) -> None:
         x=alt.X(
             "Importe rechazado:Q",
             title="Importe rechazado",
-            axis=alt.Axis(format="$,.0s"),
+            axis=alt.Axis(format="$,.2s", tickCount=5, labelOverlap=True),
             scale=alt.Scale(domain=[0, amount_max * 1.42]),
         ),
         color=alt.Color(
@@ -659,7 +682,7 @@ def rejected_bank_chart(data: pd.DataFrame) -> None:
     )
     bars = base.mark_bar(cornerRadiusEnd=8, size=36).encode(
         tooltip=[
-            alt.Tooltip("Banco:N", title="Banco"),
+            alt.Tooltip("Banco:N", title="Banco de depósito"),
             alt.Tooltip("Cantidad de rechazados:Q", title="Rechazados", format=",.0f"),
             alt.Tooltip("Importe rechazado:Q", title="Importe", format="$,.2f"),
             alt.Tooltip("Importe promedio:Q", title="Promedio", format="$,.2f"),
@@ -669,7 +692,7 @@ def rejected_bank_chart(data: pd.DataFrame) -> None:
     labels = base.mark_text(
         align="left", baseline="middle", dx=9, color=foreground, fontSize=12, fontWeight=700
     ).encode(text="Etiqueta:N")
-    chart = (bars + labels).properties(height=260).configure_view(stroke=None).configure_axis(
+    chart = (bars + labels).properties(height=220).configure_view(stroke=None).configure_axis(
         labelColor=foreground,
         titleColor=foreground,
         gridColor=grid,
@@ -679,12 +702,13 @@ def rejected_bank_chart(data: pd.DataFrame) -> None:
         titleFontSize=12,
     )
     st.altair_chart(chart, key="chart_rejected_banks")
-    with st.expander("Ver estadísticas por banco", icon=":material/table_view:"):
+    with st.expander("Ver estadísticas por banco de depósito", icon=":material/table_view:"):
         st.dataframe(
             summary,
             hide_index=True,
             width="stretch",
             column_config={
+                "Banco": st.column_config.TextColumn("Banco de depósito"),
                 "Cantidad de rechazados": st.column_config.NumberColumn(format="%d"),
                 "Importe rechazado": st.column_config.NumberColumn(format="$ %.2f"),
                 "Importe promedio": st.column_config.NumberColumn(format="$ %.2f"),
@@ -1368,10 +1392,10 @@ with st.sidebar:
         selected_types = st.pills("Tipos", list(ALLOWED_TYPES), default=list(ALLOWED_TYPES), selection_mode="multi")
         selected_clients = st.multiselect("Clientes", sorted(x for x in portfolio["Cliente"].dropna().unique() if x), placeholder="Todos")
         selected_banks = st.pills(
-            "Bancos",
+            "Banco de depósito",
             list(BANK_FILTER_OPTIONS),
             selection_mode="multi",
-            help="Filtro operativo limitado a Banco Macro, Galicia y Nación.",
+            help="Dónde se depositó el cheque: Macro, Galicia o Nación. No filtra por banco emisor. Sin selección se conservan todos los bancos y los registros sin dato.",
         )
         search = st.text_input("Buscar cheque, CUIT o recibo", placeholder="Número o texto")
     with st.expander("Guía de estados", icon=":material/help:", expanded=False):
@@ -1388,7 +1412,7 @@ elif receipt_scope == "Sin comprobante asociado": base_filtered = base_filtered[
 base_filtered = base_filtered[base_filtered["Tipo"].isin(selected_types)] if selected_types else base_filtered.iloc[0:0]
 if selected_clients: base_filtered = base_filtered[base_filtered["Cliente"].isin(selected_clients)]
 if selected_banks:
-    base_filtered = base_filtered[base_filtered["Banco cheque"].map(bank_filter_group).isin(selected_banks)]
+    base_filtered = base_filtered[base_filtered["Banco depósito"].map(deposit_bank_group).isin(selected_banks)]
 if search.strip():
     needle = search.strip().casefold()
     searchable = base_filtered[["Cliente", "CUIT cliente", "N° cheque / eCheq", "Recibo relacionado"]].fillna("").astype(str).agg(" ".join, axis=1).str.casefold()
@@ -1482,7 +1506,7 @@ elif view == "Detalle de cheques":
     st.caption(
         f"Vista seleccionada: **{scope}** · mostrando {len(filtered):,} de {len(base_filtered):,} movimientos después de aplicar los filtros.".replace(",", ".")
     )
-    columns = ["Estado calculado", "Fecha prevista de cobro", "Días al cobro", "Cliente", "Importe", "Tipo", "N° cheque / eCheq", "Banco cheque", "Fecha acreditación", "Fecha vencimiento", "Código estado", "Fuente clasificación", "Estado recibo", "Recibo relacionado", "Fuente del vínculo", "Nro Cpb Relación", "Observaciones", "Código rechazo", "Motivo rechazo", "Alertas", "Fila fuente", SOURCE_ROWS, "Historial de estados", "Duplicados consolidados"]
+    columns = ["Estado calculado", "Fecha prevista de cobro", "Días al cobro", "Cliente", "Importe", "Tipo", "N° cheque / eCheq", "Banco depósito", "Banco cheque", "Fecha acreditación", "Fecha vencimiento", "Código estado", "Fuente clasificación", "Estado recibo", "Recibo relacionado", "Fuente del vínculo", "Nro Cpb Relación", "Observaciones", "Código rechazo", "Motivo rechazo", "Alertas", "Fila fuente", SOURCE_ROWS, "Historial de estados", "Duplicados consolidados"]
     st.dataframe(
         filtered[columns],
         hide_index=True,

@@ -6,6 +6,27 @@ import pandas as pd
 
 from utils.portfolio import BANK_FILTER_OPTIONS, PENDING_COLLECTION_STATES, bank_filter_group
 
+PROCESSING_VERSION = "deposit-banks-v11"
+OTHER_DEPOSIT_BANK = "Otros bancos de depósito"
+MISSING_DEPOSIT_BANK = "Sin banco de depósito"
+
+
+def deposit_bank_group(value) -> str:
+    """No reemplaza un banco de depósito faltante por el banco emisor."""
+    if value is None or pd.isna(value) or str(value).strip().upper() in {"", "0", "0.0", "NAN", "NONE", "<NA>"}:
+        return MISSING_DEPOSIT_BANK
+    return bank_filter_group(value) or OTHER_DEPOSIT_BANK
+
+
+def rejected_bank_detail(portfolio: pd.DataFrame) -> pd.DataFrame:
+    if portfolio.empty or "Estado calculado" not in portfolio:
+        return portfolio.iloc[0:0].assign(**{"Banco de depósito agrupado": pd.Series(dtype=str)})
+    rejected = portfolio[portfolio["Estado calculado"].eq("Rechazado")].copy()
+    rejected["Banco de depósito agrupado"] = rejected.get(
+        "Banco depósito", pd.Series(index=rejected.index, dtype=object)
+    ).map(deposit_bank_group)
+    return rejected
+
 
 def pending_collection(portfolio: pd.DataFrame) -> pd.DataFrame:
     """Devuelve los cheques que todavía representan un cobro pendiente."""
@@ -100,19 +121,15 @@ def receipt_summary(portfolio: pd.DataFrame) -> pd.DataFrame:
 
 
 def rejected_bank_summary(portfolio: pd.DataFrame) -> pd.DataFrame:
-    """Resume rechazos sin ocultar los bancos fuera del foco operativo."""
+    """Resume RC efectivos por banco de depósito, nunca por banco girado."""
     columns = ["Banco", "Cantidad de rechazados", "Importe rechazado", "Importe promedio", "Clientes afectados"]
     if portfolio.empty or "Estado calculado" not in portfolio:
         return pd.DataFrame(columns=columns)
 
-    rejected = portfolio[portfolio["Estado calculado"].eq("Rechazado")].copy()
+    rejected = rejected_bank_detail(portfolio)
     if rejected.empty:
         return pd.DataFrame(columns=columns)
-    rejected["Banco"] = (
-        rejected.get("Banco cheque", pd.Series(index=rejected.index, dtype=object))
-        .map(bank_filter_group)
-        .replace("", "Otros bancos")
-    )
+    rejected["Banco"] = rejected["Banco de depósito agrupado"]
 
     amounts = rejected.get("Importe", pd.Series(0.0, index=rejected.index))
     rejected["Importe"] = pd.to_numeric(amounts, errors="coerce").fillna(0)
@@ -125,7 +142,9 @@ def rejected_bank_summary(portfolio: pd.DataFrame) -> pd.DataFrame:
             "Clientes afectados": ("Cliente", lambda values: values[values.ne("")].nunique()),
         }
     )
-    display_order = (*BANK_FILTER_OPTIONS, "Otros bancos")
+    display_order = [*BANK_FILTER_OPTIONS, *(
+        bank for bank in (OTHER_DEPOSIT_BANK, MISSING_DEPOSIT_BANK) if bank in set(rejected["Banco"])
+    )]
     summary = summary.set_index("Banco").reindex(display_order, fill_value=0).reset_index()
     order = {bank: index for index, bank in enumerate(display_order)}
     summary["_orden"] = summary["Banco"].map(order)

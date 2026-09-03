@@ -23,6 +23,8 @@ from reportlab.platypus import (
 
 from utils.analytics import rejected_bank_summary
 
+PROCESSING_VERSION = "deposit-banks-v11"
+
 
 NAVY = colors.HexColor("#17365D")
 BLUE = colors.HexColor("#245A8D")
@@ -269,7 +271,7 @@ def export_portfolio_pdf(portfolio: pd.DataFrame, cutoff: date) -> bytes:
             if int(row[1]) > 0
         ]
         if bank_parts:
-            bank_rejection_text = " Rechazos por banco girado: <b>" + "; ".join(bank_parts) + "</b>."
+            bank_rejection_text = " Rechazos por banco de depósito (no emisor): <b>" + "; ".join(bank_parts) + "</b>."
     summary_block = KeepTogether([
         Paragraph("Composición de la cartera", section_style),
         state_table,

@@ -46,6 +46,15 @@ def test_bank_filter_groups_codes_and_names(raw_bank, expected):
     assert bank_filter_group(raw_bank) == expected
 
 
+@pytest.mark.parametrize("deposit_column", ["Nombre del banco", "MCR-Banco depósito"])
+def test_deposit_bank_is_kept_separate_from_cheque_issuer(deposit_column):
+    result = build_portfolio(pd.DataFrame([row(**{
+        deposit_column: "Banco Macro", "MCR-Banco": "ICBC", "MCR-Estado instr.": "RC",
+    })]), date(2026, 8, 18)).iloc[0]
+    assert result["Banco depósito"] == "Banco Macro"
+    assert result["Banco cheque"] == "ICBC"
+
+
 def make_xlsx(rows, preamble=2):
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
