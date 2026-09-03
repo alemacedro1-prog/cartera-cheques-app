@@ -100,6 +100,7 @@ def test_rejected_bank_chart_and_filter_use_deposit_not_issuer(monkeypatch, sele
     assert metrics["Macro · 1 rechazados"] == "$ 300"
     # El filtro Macro afecta el gráfico, pero no el resumen completo del archivo.
     assert [item.value for item in app.metric[:5]] == ["5", "0", "0", "5", "0"]
+    assert len(app.dataframe[0].value) == 5  # Tampoco recorta el listado inicial sin recibo.
     summary = next(table.value for table in app.dataframe if "Importe rechazado" in table.value.columns and "Banco" in table.value.columns)
     assert summary["Importe rechazado"].sum() == (300 if selected_banks else 2500)
     assert summary["Cantidad de rechazados"].sum() == (1 if selected_banks else 5)
@@ -148,3 +149,66 @@ def test_upload_overview_is_not_shown_before_file_is_loaded(monkeypatch):
     assert not app.exception
     assert "Resumen del archivo" not in [item.value for item in app.subheader]
     assert not app.metric
+
+
+@pytest.mark.parametrize("module", ["Cartera de cheques", "Control de movimientos y recibos"])
+def test_unlinked_cheques_include_accredited_and_preserve_dates_and_consolidation(monkeypatch, module):
+    records = [
+        ("AC", "101", 100, "Zeta", "", "01/08/2026"),
+        ("AC", "101", 100, "Zeta", "", "01/08/2026"),
+        ("PS", "102", 200, "Alfa", "", ""),
+        ("AC", "103", 300, "Con recibo", "756699", "01/08/2026"),
+        ("RC", "104", 400, "Beta", "", ""),
+    ]
+    rows = [
+        {"MCR-Medio de pago": "CPD", "MCR-Estado instr.": state, "MCR-Número de cheque": number,
+         "MCR-Importe instr.": amount, "MCR-Nombre cliente": client, "Observación": receipt,
+         "MCR-Fecha acredit.": credited_date, "MCR-Fecha vencim.": "10/09/2026"}
+        for state, number, amount, client, receipt, credited_date in records
+    ]
+    upload = BytesIO()
+    pd.DataFrame(rows).to_excel(upload, index=False)
+    upload.name = "CONRENPF_no_tomados_sintetico.xlsx"
+    monkeypatch.setattr(st, "file_uploader", lambda *args, **kwargs: upload)
+    original_segmented = st.segmented_control
+
+    def choose(label, *args, **kwargs):
+        if label == "Módulo":
+            return module
+        if label == "Sección":
+            return "Control de recibos"
+        return original_segmented(label, *args, **kwargs)
+
+    monkeypatch.setattr(st, "segmented_control", choose)
+    app = AppTest.from_file(str(Path(__file__).parents[1] / "streamlit_app.py"), default_timeout=45)
+    app.secrets["app"] = {"require_auth": False}
+    app.run()
+    assert not app.exception, [item.message for item in app.exception]
+    listing = app.dataframe[0].value
+    assert list(listing.columns) == ["Cliente", "N° cheque / eCheq", "Importe", "Fecha acreditación", "Estado calculado", "Filas originales del CONRENPF"]
+    assert listing["Cliente"].tolist() == ["Alfa", "Beta", "Zeta"]
+    assert listing["Importe"].sum() == 700
+    assert len(listing) == int(app.metric[3].value) == 3
+    credited = listing[listing["N° cheque / eCheq"].eq("101")].iloc[0]
+    assert credited["Estado calculado"] == "Acreditado"
+    assert credited["Fecha acreditación"] == pd.Timestamp("2026-08-01")
+    assert credited["Filas originales del CONRENPF"] == "2, 3"
+    assert pd.isna(listing.iloc[0]["Fecha acreditación"])
+    assert "103" not in set(listing["N° cheque / eCheq"])
+    if module == "Cartera de cheques":
+        detailed = next(table.value for table in app.dataframe if "Observaciones" in table.value.columns and "Fecha acreditación" in table.value.columns)
+        assert set(detailed["N° cheque / eCheq"]) == {"101", "102", "104"}
+
+
+def test_unlinked_cheques_empty_list_reports_all_receipts_found(monkeypatch):
+    upload = BytesIO()
+    pd.DataFrame([{"MCR-Medio de pago": "CPD", "MCR-Estado instr.": "AC", "MCR-Importe instr.": 100,
+                   "MCR-Número de cheque": "101", "Nro Cpb Relación": "819-123456"}]).to_excel(upload, index=False)
+    upload.name = "CONRENPF_con_recibo_sintetico.xlsx"
+    monkeypatch.setattr(st, "file_uploader", lambda *args, **kwargs: upload)
+    app = AppTest.from_file(str(Path(__file__).parents[1] / "streamlit_app.py"), default_timeout=45)
+    app.secrets["app"] = {"require_auth": False}
+    app.run()
+    assert not app.exception
+    assert "Todos los cheques tienen un recibo asociado." in [item.value for item in app.success]
+    assert app.metric[3].value == "0"

@@ -65,6 +65,8 @@ Sin `.streamlit/secrets.toml`, la app muestra una advertencia y funciona solo co
 
 Al cargar el archivo se muestra primero un resumen de cheques únicos: total, pendientes de cobro (todos los meses) y acreditados; debajo, sin recibo y con recibo. Cada tarjeta incluye cantidad e importe. El resumen usa la cartera consolidada completa, no los filtros de pantalla ni los movimientos bancarios MANU/transferencias. Los recibos se cuentan en todos los estados, incluidos los acreditados.
 
+Debajo aparece el listado **Cheques no tomados · sin recibo asociado**, ordenado por cliente: número de cheque/eCheq, importe, fecha de acreditación, estado y filas fuente. Incluye AC sin recibo, sin limitarse al mes ni al estado pendiente. La fecha es la informada en el archivo; si falta, no se inventa ni se usa el vencimiento. El listado también está disponible en Control de recibos para la selección actual.
+
 ## Rechazos por banco de depósito
 
 - El gráfico y el filtro bancario de cartera usan `Banco depósito` (`Nombre del banco` o `MCR-Banco depósito` en el CONRENPF), no el banco emisor del cheque.

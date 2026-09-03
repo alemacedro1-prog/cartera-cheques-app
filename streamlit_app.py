@@ -231,6 +231,41 @@ def make_pdf(portfolio: pd.DataFrame, cutoff: date) -> bytes:
     return export_portfolio_pdf(portfolio, cutoff)
 
 
+def unlinked_cheques_table(portfolio: pd.DataFrame, key: str, *, full_file: bool = False) -> None:
+    st.subheader("Cheques no tomados · sin recibo asociado")
+    st.caption(
+        ("Listado completo del archivo, sin aplicar los filtros de abajo. " if full_file else "Listado de la selección actual. ")
+        + "Incluye los ya acreditados: estar acreditado no significa tener recibo. Ordenado por cliente."
+    )
+    if portfolio.empty:
+        st.info("No hay cheques en esta selección.")
+        return
+    linked = portfolio["Estado recibo"].eq("Tomado")
+    missing = portfolio[~linked].copy()
+    if missing.empty:
+        st.success("Todos los cheques tienen un recibo asociado.", icon=":material/check_circle:")
+        return
+    count_label = f"{len(missing):,}".replace(",", ".")
+    st.caption(f"{count_label} cheques sin tomar · Importe total: **{format_currency(missing['Importe'].sum())}**")
+    st.caption("La fecha de acreditación es la informada en el archivo. Si falta, queda vacía; no se reemplaza por el vencimiento.")
+    columns = ["Cliente", "N° cheque / eCheq", "Importe", "Fecha acreditación", "Estado calculado", SOURCE_ROWS]
+    if not full_file:
+        columns += ["Tipo", "Nro Cpb Relación", "Observaciones", "Fila fuente"]
+    st.dataframe(
+        missing.sort_values(["Cliente", "Fecha acreditación", "N° cheque / eCheq"], na_position="last")[columns],
+        hide_index=True,
+        height=360,
+        key=key,
+        column_config={
+            "Cliente": st.column_config.TextColumn(pinned=True),
+            "N° cheque / eCheq": st.column_config.TextColumn("N° cheque / eCheq"),
+            "Importe": st.column_config.NumberColumn(format="$ %.2f"),
+            "Fecha acreditación": st.column_config.DateColumn(format="DD/MM/YYYY"),
+            "Estado calculado": st.column_config.TextColumn("Estado del cheque"),
+        },
+    )
+
+
 def uploaded_cheques_overview(portfolio: pd.DataFrame) -> None:
     """Resumen completo del archivo, antes de los módulos y sus filtros."""
     states = portfolio.get("Estado calculado", pd.Series(index=portfolio.index, dtype=object))
@@ -261,6 +296,8 @@ def uploaded_cheques_overview(portfolio: pd.DataFrame) -> None:
     with st.container(horizontal=True):
         card("Sin recibo asociado", portfolio[~linked], "No se detectó recibo en Observación ni en Nro Cpb Relación.", "overview_without_receipt")
         card("Con recibo asociado", portfolio[linked], "Recibo identificado en Observación o Nro Cpb Relación, incluidos los números internos que empiezan con 75.", "overview_with_receipt")
+    with st.container(border=True):
+        unlinked_cheques_table(portfolio, "overview_unlinked_cheques", full_file=True)
 
 
 def recovered_cheques_table(portfolio: pd.DataFrame, key: str) -> None:
@@ -1590,16 +1627,7 @@ elif view == "Control de recibos":
             description="Indica si el número surgió de la observación o del comprobante relacionado.",
         )
     with right, st.container(border=True, height="stretch"):
-        st.subheader("Cheques sin recibo identificado")
-        st.caption("Estos movimientos necesitan revisión porque no se encontró un número de recibo o comprobante asociado.")
-        if missing.empty:
-            st.success("Todos los cheques tienen un recibo identificado.", icon=":material/check_circle:")
-        else:
-            st.dataframe(
-                missing[["Cliente", "Tipo", "N° cheque / eCheq", "Nro Cpb Relación", "Observaciones", "Fila fuente"]],
-                hide_index=True,
-                height=430,
-            )
+        unlinked_cheques_table(base_filtered, "receipt_control_unlinked_cheques")
 else:
     st.subheader("Descargar reportes")
     st.caption("Generá documentos para compartir la posición completa o trabajar con la vista filtrada.")
